@@ -1,5 +1,6 @@
 "use client";
 import { useState, useEffect, useRef, useMemo } from "react";
+import { useRouter } from "next/navigation";
 import {
   DEMO_RESPONSES, TIME_SLOTS, APPT_TYPES, INITIAL_APPOINTMENTS,
   VISIT_NOTES as DEMO_VISIT_NOTES, getTagStyle, STAFF,
@@ -2308,6 +2309,19 @@ const PatientHealthRadar = ({ onToolResult }: { onToolResult: (entry: string) =>
 
 /* ─── Patient Portal Component ─── */
 export default function PatientPortal() {
+  const router = useRouter();
+  const [authChecked, setAuthChecked] = useState(false);
+
+  useEffect(() => {
+    const auth = localStorage.getItem("medassist-auth");
+    if (!auth) { router.replace("/login"); return; }
+    try {
+      const p = JSON.parse(auth);
+      if (!p.authenticated) { router.replace("/login"); return; }
+    } catch { router.replace("/login"); return; }
+    setAuthChecked(true);
+  }, [router]);
+
   const [activeTab, setActiveTab] = useState("Overview");
   const [chatHovered, setChatHovered] = useState(false);
   const [activeNav, setActiveNav] = useState("Dashboard");
@@ -2591,6 +2605,8 @@ export default function PatientPortal() {
     { label: "Vitals", icon: <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/><circle cx="12" cy="12" r="1"/></svg> },
     { label: "Health Radar", icon: <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/><line x1="12" y1="22" x2="12" y2="15.5"/><line x1="22" y1="8.5" x2="15" y2="12"/><line x1="2" y1="8.5" x2="9" y2="12"/></svg> },
   ];
+
+  if (!authChecked) return <div style={{ minHeight: "100vh", background: "#f4f5f7" }} />;
 
   return (
     <div style={{ display: "flex", minHeight: "100vh" }}>
