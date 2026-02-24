@@ -1,427 +1,40 @@
 "use client";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
+import {
+  DEMO_RESPONSES, TIME_SLOTS, APPT_TYPES, INITIAL_APPOINTMENTS,
+  VISIT_NOTES as DEMO_VISIT_NOTES, getTagStyle, STAFF,
+  PATIENT_INFO as DEMO_PATIENT_INFO, formatTime12, DEMO_PATIENTS,
+  COMMON_MEDICATIONS, RX_FREQUENCIES, RX_ROUTES, COMMON_DOSES,
+  PENICILLIN_CLASS_DRUGS,
+  LAB_TRENDS, BP_READINGS, VITAL_TRENDS, MEDICATION_TIMELINE,
+  REFERENCE_RANGES, computeBodySystemScores,
+} from "@/lib/patient-data";
+import type { Appointment, PrescriptionItem, LabTrendPoint } from "@/lib/patient-data";
 
-/* ─── Chat Demo Data ─── */
-const DEMO_RESPONSES: Record<string, any> = {
-  interactions: {
-    type: "alert",
-    severity: "high",
-    title: "Drug Interaction Alert",
-    content: [
-      { pair: "Aspirin + Warfarin (if added)", severity: "high", detail: "Both agents affect coagulation. Concurrent use increases bleeding risk significantly. Monitor INR closely.", source: "OpenFDA Drug Interaction API" },
-      { pair: "Lisinopril + Potassium", severity: "low", detail: "ACE inhibitors can increase potassium levels. Patient labs show K+ 5.8 (HIGH). Recommend close monitoring.", source: "RxNorm / DailyMed" },
-    ],
-    recommendation: "Potassium is critically elevated at 5.8 mEq/L with concurrent ACE inhibitor use. Consider holding Lisinopril and rechecking K+ level.",
-    sources: ["OpenFDA DrugInteraction API", "RxNorm REST API", "OpenEMR FHIR /MedicationRequest"],
-  },
-  labs: {
-    type: "lab_summary",
-    title: "Lab Results Summary",
-    content: {
-      flagged: [
-        { test: "Potassium (K)", value: "5.8 mEq/L", interpretation: "Above normal range (3.5–5.0). Hyperkalemia risk — may be related to ACE inhibitor therapy. Requires follow-up.", trend: "up" },
-        { test: "Copper (Cu)", value: "62 µg/dL", interpretation: "Below normal range (70–140). Mild copper deficiency. Consider dietary assessment or supplementation.", trend: "down" },
-      ],
-      normal: ["Calcium 9.4 (normal)", "Magnesium 2.1 (normal)", "Sodium 140 (normal)", "Chloride 101 (normal)"],
-    },
-    recommendation: "Potassium elevation is the primary concern given concurrent Lisinopril. Recommend repeat BMP and consider dose adjustment. Low copper is incidental — monitor.",
-    sources: ["OpenEMR FHIR /Observation", "LOINC Reference Ranges", "Clinical Decision Support"],
-  },
-  meds: {
-    type: "med_review",
-    title: "Medication Review",
-    content: {
-      active: [
-        { name: "Enteric Coated Aspirin", dose: "325mg", freq: "Daily", purpose: "Cardioprotective" },
-        { name: "Tylenol Acetaminophen", dose: "500mg", freq: "PRN", purpose: "Pain management" },
-        { name: "Lisinopril", dose: "10mg", freq: "Daily", purpose: "Hypertension" },
-        { name: "Doxycycline", dose: "100mg", freq: "BID", purpose: "Ear abscess (infection)" },
-      ],
-      considerations: [
-        "Aspirin 325mg: Higher dose — evaluate if 81mg low-dose would be more appropriate for maintenance cardioprotection.",
-        "Lisinopril: BP 132/83 still above target. K+ elevated at 5.8 — reassess ACE inhibitor vs. ARB.",
-        "Doxycycline: Appropriate for external ear abscess. Verify course duration (typically 7–14 days).",
-        "Acetaminophen PRN: Safe at current dose. Ensure patient not exceeding 3g/day with OTC use.",
-      ],
-    },
-    recommendation: "Key gap: No documented statin therapy. Given hypertension + age, ACC/AHA guidelines may recommend moderate-intensity statin. Discuss with patient.",
-    sources: ["OpenEMR FHIR /MedicationRequest", "ACC/AHA 2024 Guidelines", "Clinical Pharmacology DB"],
-  },
+/* ─── AI text rendering helper ─── */
+const renderAIText = (text: string) => {
+  const lines = text.split("\n");
+  return lines.map((line, i) => {
+    if (!line.trim()) return <br key={i} />;
+    // Headers
+    if (line.startsWith("### ")) return <h4 key={i} style={{ fontSize: 13, fontWeight: 700, color: "#1e293b", margin: "8px 0 4px" }}>{line.slice(4)}</h4>;
+    if (line.startsWith("## ")) return <h3 key={i} style={{ fontSize: 14, fontWeight: 700, color: "#1e293b", margin: "8px 0 4px" }}>{line.slice(3)}</h3>;
+    // Bullet points
+    if (line.match(/^[-*•]\s/)) {
+      const content = line.replace(/^[-*•]\s/, "");
+      return <div key={i} style={{ display: "flex", gap: 6, margin: "2px 0", fontSize: 13, color: "#374151" }}><span style={{ color: "#6b7280" }}>&#8226;</span><span dangerouslySetInnerHTML={{ __html: inlineMd(content) }} /></div>;
+    }
+    return <p key={i} style={{ fontSize: 13, color: "#374151", margin: "2px 0", lineHeight: 1.5 }} dangerouslySetInnerHTML={{ __html: inlineMd(line) }} />;
+  });
 };
 
-/* ─── Appointment Data ─── */
-interface Appointment {
-  id: string;
-  date: string;
-  time: string;
-  patientName: string;
-  patientId: string;
-  type: string;
-  provider: string;
-}
+const inlineMd = (text: string) =>
+  text
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*(.+?)\*/g, "<em>$1</em>")
+    .replace(/`(.+?)`/g, '<code style="background:#f1f5f9;padding:1px 4px;border-radius:3px;font-size:12px">$1</code>');
 
-const TIME_SLOTS = [
-  "09:00","09:30","10:00","10:30","11:00","11:30",
-  "12:00","12:30","13:00","13:30","14:00","14:30",
-  "15:00","15:30","16:00","16:30",
-];
-
-const APPT_TYPES = ["Follow-up", "Lab Review", "General Checkup", "Consultation"];
-
-const INITIAL_APPOINTMENTS: Appointment[] = [
-  { id: "a1", date: "2026-02-24", time: "09:00", patientName: "Jane Doe", patientId: "other", type: "General Checkup", provider: "Dr. Patel" },
-  { id: "a2", date: "2026-02-24", time: "10:30", patientName: "Gord Sims", patientId: "gord-sims", type: "Follow-up", provider: "Dr. Patel" },
-  { id: "a3", date: "2026-02-24", time: "14:00", patientName: "Bob Smith", patientId: "other", type: "Lab Review", provider: "Dr. Kim" },
-  { id: "a4", date: "2026-02-25", time: "09:00", patientName: "Alice Johnson", patientId: "other", type: "Cardiology", provider: "Dr. Kim" },
-  { id: "a5", date: "2026-02-25", time: "11:00", patientName: "Carlos Rivera", patientId: "other", type: "Follow-up", provider: "Dr. Patel" },
-  { id: "a6", date: "2026-02-25", time: "14:30", patientName: "Maria Lopez", patientId: "other", type: "General Checkup", provider: "Dr. Patel" },
-  { id: "a7", date: "2026-02-26", time: "09:30", patientName: "Gord Sims", patientId: "gord-sims", type: "Lab Review", provider: "Dr. Patel" },
-  { id: "a8", date: "2026-02-26", time: "11:00", patientName: "Tom Baker", patientId: "other", type: "Consultation", provider: "Dr. Kim" },
-  { id: "a9", date: "2026-02-26", time: "15:00", patientName: "Sarah Chen", patientId: "other", type: "Follow-up", provider: "Dr. Patel" },
-  { id: "a10", date: "2026-02-27", time: "10:00", patientName: "David Kim", patientId: "other", type: "Lab Review", provider: "Dr. Kim" },
-  { id: "a11", date: "2026-02-27", time: "13:30", patientName: "Nancy White", patientId: "other", type: "General Checkup", provider: "Dr. Patel" },
-  { id: "a12", date: "2026-03-02", time: "09:00", patientName: "James Brown", patientId: "other", type: "Follow-up", provider: "Dr. Patel" },
-  { id: "a13", date: "2026-03-02", time: "11:30", patientName: "Emily Davis", patientId: "other", type: "Consultation", provider: "Dr. Kim" },
-  { id: "a14", date: "2026-03-03", time: "10:00", patientName: "Gord Sims", patientId: "gord-sims", type: "Cardiology", provider: "Dr. Kim" },
-  { id: "a15", date: "2026-03-04", time: "14:00", patientName: "Lisa Park", patientId: "other", type: "Follow-up", provider: "Dr. Patel" },
-  { id: "a16", date: "2026-03-05", time: "09:30", patientName: "Mike Taylor", patientId: "other", type: "General Checkup", provider: "Dr. Kim" },
-];
-
-const formatTime12 = (t: string) => {
-  const [h, m] = t.split(":").map(Number);
-  const ampm = h >= 12 ? "PM" : "AM";
-  return `${h > 12 ? h - 12 : h}:${m.toString().padStart(2, "0")} ${ampm}`;
-};
-
-/* ─── Visit Notes (15 entries, 2 years — Gord Sims) ─── */
-const VISIT_NOTES = [
-  {
-    id: "vn-01", date: "2024-02-08", type: "Initial Consultation", provider: "Dr. Patel",
-    chief: "New patient intake — elevated blood pressure readings at pharmacy screening",
-    summary: "Patient presents for initial evaluation after pharmacy screening showed BP 152/94. Reports occasional headaches, especially in the afternoon. No prior diagnosis of hypertension. Family history: father had HTN and MI at 62. Lifestyle assessment: sedentary desk job, moderate alcohol intake (2-3 beers/week), former smoker (quit 2019). BMI 29.2. Started on lifestyle modifications — low sodium diet, 30 min walking daily. Ordered baseline labs including CMP, lipid panel, CBC.",
-    tags: ["Lab Order", "Blood Work"],
-    actions: ["Ordered CMP + lipid panel + CBC", "Dietary counseling — low sodium", "Exercise prescription: 30 min walking/day", "Follow-up in 4 weeks with BP log"],
-  },
-  {
-    id: "vn-02", date: "2024-03-12", type: "Follow-up", provider: "Dr. Patel",
-    chief: "BP log review — consistently 145–155/88–94 over 4 weeks",
-    summary: "Patient returns with home BP log showing persistent elevation. Average reading 148/91. Labs from last visit: LDL 158 (high), HDL 42 (low), TG 172, fasting glucose 102 (borderline). CMP otherwise normal — K+ 4.6, creatinine 0.9. Started Lisinopril 10mg daily for hypertension. Discussed statin therapy for dyslipidemia — patient prefers to try diet first. Also started low-dose aspirin 325mg daily given cardiovascular risk factors. Allergies confirmed: Peanuts, Gluten, Penicillin.",
-    tags: ["Prescription", "Lab Review"],
-    actions: ["Rx: Lisinopril 10mg daily", "Rx: Aspirin 325mg daily", "Statin discussion deferred — patient prefers diet trial", "Recheck BP + labs in 8 weeks"],
-  },
-  {
-    id: "vn-03", date: "2024-05-14", type: "Lab Follow-up", provider: "Dr. Patel",
-    chief: "8-week recheck — BP response to Lisinopril",
-    summary: "BP today 138/86, improved from 148/91 baseline. Patient tolerating Lisinopril well, no cough or dizziness. Labs: K+ 4.8, creatinine 0.9 (stable). LDL still 148 despite dietary changes. Patient now agreeable to discussing statin but wants to wait one more quarter. Weight stable at 195 lbs. Urged continued lifestyle modifications. Will recheck in 3 months.",
-    tags: ["Lab Work", "Blood Work"],
-    actions: ["BP improved — continue Lisinopril 10mg", "K+ 4.8 — monitor on ACE inhibitor", "LDL 148 — statin discussion next visit", "Continue aspirin 325mg"],
-  },
-  {
-    id: "vn-04", date: "2024-08-06", type: "Urgent Visit", provider: "Dr. Patel",
-    chief: "Chest pain — sharp, worse with deep breathing, 2 days",
-    summary: "Patient presents with 2-day history of sharp anterior chest pain, worse with inspiration and when lying flat. No radiation to arm/jaw. Relieved by leaning forward. VS: BP 144/90, HR 92, Temp 100.1°F, SpO2 97%. ECG shows diffuse ST elevation with PR depression — classic pericarditis pattern. Troponin negative. CRP markedly elevated at 48 mg/L. Diagnosed with acute pericarditis, likely viral etiology. Cannot use NSAIDs as first-line due to existing aspirin use — will optimize aspirin dose. Added colchicine 0.5mg BID. Urgent cardiology referral to Dr. Kim for echocardiogram.",
-    tags: ["Fever", "ECG", "Prescription", "Referral"],
-    actions: ["ECG — diffuse ST elevation, PR depression", "Troponin negative", "CRP 48 mg/L (elevated)", "Rx: Colchicine 0.5mg BID", "Continue Aspirin 325mg (anti-inflammatory dose)", "Urgent cardiology referral to Dr. Kim"],
-  },
-  {
-    id: "vn-05", date: "2024-08-20", type: "Cardiology Consult", provider: "Dr. Kim",
-    chief: "Pericarditis evaluation — echocardiogram",
-    summary: "Cardiology evaluation for acute pericarditis. Echocardiogram performed: EF 60%, no pericardial effusion, normal wall motion, no valvular abnormalities. Patient reports chest pain has improved significantly since starting colchicine. Still mild discomfort with deep breathing. CRP down to 18 from 48. Continue colchicine for 3 months minimum. Follow-up echo in 6 weeks if symptoms recur. Cleared for gradual return to exercise once pain-free for 1 week.",
-    tags: ["Echo", "Lab Review"],
-    actions: ["Echo: EF 60%, no effusion", "CRP 18 (improving from 48)", "Continue colchicine 0.5mg BID x 3 months", "Gradual return to exercise when pain-free", "Follow-up echo if symptoms recur"],
-  },
-  {
-    id: "vn-06", date: "2024-11-05", type: "Follow-up", provider: "Dr. Patel",
-    chief: "Pericarditis 3-month follow-up — completing colchicine course",
-    summary: "Patient reports complete resolution of chest pain. No recurrence of symptoms. BP 136/84 on Lisinopril. Labs: CRP normalized at 3.2, K+ 5.0 (upper normal on ACE inhibitor), creatinine 1.0. Pericarditis considered resolved. Discontinuing colchicine after 3-month course. Will continue monitoring CRP at next visit. Flu vaccine administered. Weight stable at 196 lbs.",
-    tags: ["Lab Review", "Vaccination"],
-    actions: ["Pericarditis resolved — discontinue colchicine", "CRP normalized at 3.2", "K+ 5.0 — monitor (upper normal on ACE inhibitor)", "Flu vaccine given", "Continue Lisinopril 10mg + Aspirin 325mg"],
-  },
-  {
-    id: "vn-07", date: "2025-01-15", type: "Routine Follow-up", provider: "Dr. Patel",
-    chief: "Quarterly HTN management — BP still above target",
-    summary: "BP today 140/88. Not at goal of <130/80. Patient admits inconsistent with low-sodium diet over holidays. K+ 5.1 — creeping up, need to watch closely on ACE inhibitor. Creatinine stable at 1.0. Discussed increasing Lisinopril dose vs. adding second agent. Patient prefers to try dietary compliance first. Set strict 3-month deadline — if BP not at goal, will escalate therapy. Ordered repeat labs for next visit. Still no statin — LDL likely still elevated.",
-    tags: ["Blood Work", "Lab Order"],
-    actions: ["BP 140/88 — above target", "K+ 5.1 — trending up, monitor", "Dietary compliance counseling — sodium restriction", "3-month deadline for BP control", "Labs ordered for next visit"],
-  },
-  {
-    id: "vn-08", date: "2025-03-10", type: "Urgent Visit", provider: "Dr. Patel",
-    chief: "Severe abdominal pain — cramping, lower abdomen, 3 days",
-    summary: "Patient presents with 3-day history of cramping abdominal pain, predominantly left lower quadrant. Associated with intermittent nausea. No vomiting, no diarrhea, no fever. Abdomen mildly tender in LLQ, no guarding or rebound. Bowel sounds present. Labs: CBC normal, lipase normal. Gluten exposure 5 days ago (accidental — restaurant error) may be contributing given gluten sensitivity. Recommended clear liquid diet for 24 hours then gradual reintroduction. If worsening or fever develops, return for CT scan. Prescribed Tylenol 500mg PRN for pain (avoiding NSAIDs).",
-    tags: ["Prescription", "Lab Work"],
-    actions: ["Abdominal exam — LLQ tenderness, no peritoneal signs", "CBC + lipase — normal", "Rx: Tylenol 500mg PRN", "Clear liquid diet x 24 hrs", "Return if worsening — CT scan if needed", "Gluten avoidance counseling"],
-  },
-  {
-    id: "vn-09", date: "2025-04-22", type: "GI Follow-up", provider: "Dr. Patel",
-    chief: "Persistent intermittent abdominal pain — CT abdomen ordered",
-    summary: "Patient reports abdominal pain improved but still has intermittent episodes, 2-3 times per week, mostly after meals. No weight loss, no bloody stool. Given persistent symptoms, ordered abdominal CT with contrast to rule out structural pathology. Also ordered celiac panel given known gluten sensitivity — may be undiagnosed celiac disease. BP today 142/86. K+ 5.2 — continuing to trend up. Discussed timeline for BP medication change if potassium continues rising.",
-    tags: ["Imaging", "Lab Order", "Blood Work"],
-    actions: ["Abdominal CT with contrast ordered", "Celiac panel ordered", "K+ 5.2 — trending up, reassess ACE inhibitor", "BP 142/86 — still not at goal", "Follow-up with CT results in 2 weeks"],
-  },
-  {
-    id: "vn-10", date: "2025-05-08", type: "Results Review", provider: "Dr. Patel",
-    chief: "CT abdomen results — small bowel unremarkable",
-    summary: "Abdominal CT reviewed: small bowel pattern unremarkable, no masses, no obstruction, no lymphadenopathy. Mild colonic diverticulosis noted (age-appropriate). Celiac panel: tTG-IgA mildly elevated at 22 (normal <15), suggesting possible celiac disease. Recommended strict gluten-free diet trial and GI referral for possible endoscopy/biopsy. Patient acknowledges difficulty avoiding gluten. Provided resources for gluten-free eating. Abdominal pain likely related to gluten sensitivity/possible celiac.",
-    tags: ["Imaging", "Lab Review", "Referral"],
-    actions: ["CT: unremarkable, mild diverticulosis", "Celiac panel: tTG-IgA 22 (mildly elevated)", "GI referral for possible endoscopy", "Strict gluten-free diet recommended", "Dietary resources provided"],
-  },
-  {
-    id: "vn-11", date: "2025-06-18", type: "Lab Follow-up", provider: "Dr. Patel",
-    chief: "Quarterly labs — potassium trending higher on ACE inhibitor",
-    summary: "Labs reviewed: K+ 5.4 (was 5.2 in April, 5.1 in Jan, 5.0 in Nov). Concerning upward trend on Lisinopril. Creatinine 1.0 (stable). Copper 62 µg/dL — incidentally found to be low (range 70-140). May be related to dietary restrictions from gluten avoidance. Recommended copper-rich foods (shellfish, nuts — avoiding peanuts, dark chocolate). BP 138/86. Abdominal pain has improved significantly on gluten-free diet. GI referral pending — patient on waitlist.",
-    tags: ["Blood Work", "Lab Review"],
-    actions: ["K+ 5.4 — ACE inhibitor contributing, reassess at next visit", "Copper 62 — low, dietary supplementation advised", "Creatinine 1.0 — stable", "BP 138/86 — still above target", "Abdominal pain improving on GF diet"],
-  },
-  {
-    id: "vn-12", date: "2025-08-13", type: "Imaging Visit", provider: "Dr. Patel",
-    chief: "Chest X-ray — routine screening given smoking history",
-    summary: "Routine chest X-ray ordered given former smoker history (quit 2019, ~15 pack-year history). Results: bilateral findings consistent with early emphysematous changes, predominantly upper lobes. No masses, no infiltrates, no pleural effusion. Heart size normal. Discussed findings with patient — early emphysema likely related to prior smoking. Recommended pulmonary function testing (PFTs) to establish baseline. Encouraged continued smoking cessation. No active treatment needed at this time.",
-    tags: ["X-Ray", "Imaging", "Screening"],
-    actions: ["Chest X-ray: early emphysema, bilateral upper lobes", "No masses or infiltrates", "PFT referral ordered", "Smoking cessation reinforced", "Follow-up imaging in 12 months"],
-  },
-  {
-    id: "vn-13", date: "2025-09-24", type: "Follow-up", provider: "Dr. Patel",
-    chief: "PFT results review and comprehensive management check",
-    summary: "PFT results: FEV1 78% predicted, FVC 85% predicted, FEV1/FVC 92%. Mild obstructive pattern consistent with early COPD/emphysema. No bronchodilator response. Patient asymptomatic — no dyspnea, no chronic cough. No treatment needed now but will monitor annually. BP today 134/84 — best in months, patient reports strict low-sodium compliance. K+ 5.5 — still trending up. Need to seriously consider switching from Lisinopril to ARB (losartan) to potentially reduce hyperkalemia risk. Discussed with patient — agreed to switch at next visit if K+ remains elevated.",
-    tags: ["Lab Review", "Screening"],
-    actions: ["PFTs: FEV1 78%, FVC 85%, FEV1/FVC 92% — mild obstruction", "Early COPD — no treatment needed, annual monitoring", "BP 134/84 — improving", "K+ 5.5 — plan to switch ACE to ARB next visit", "Continue aspirin + Tylenol PRN"],
-  },
-  {
-    id: "vn-14", date: "2025-12-03", type: "Acute Visit", provider: "Dr. Patel",
-    chief: "Right ear pain, swelling, drainage for 5 days",
-    summary: "Patient presents with 5-day history of right ear pain with swelling of external ear canal. Purulent drainage noted. Temp 99.4°F. Otoscopic exam: external auditory canal erythematous and edematous with visible abscess formation. TM obscured by swelling. No hearing loss reported. Diagnosed with abscess of external auditory canal. Cannot use penicillin-class antibiotics (allergy). Started Doxycycline 100mg BID for 10 days. Warm compresses. If no improvement in 72 hours, may need I&D. Also noted: nausea reported intermittently over past 2 weeks — possibly related to stress/dietary triggers. Will address at follow-up.",
-    tags: ["Fever", "Prescription"],
-    actions: ["Otoscopic exam — abscess of external auditory canal", "Rx: Doxycycline 100mg BID x 10 days", "Warm compresses to affected ear", "Return in 72 hrs if no improvement for possible I&D", "Nausea noted — address at follow-up"],
-  },
-  {
-    id: "vn-15", date: "2026-01-14", type: "Follow-up", provider: "Dr. Patel",
-    chief: "Ear abscess follow-up — labs show K+ 5.8, nausea persisting",
-    summary: "Ear abscess improving on Doxycycline — swelling reduced, drainage minimal, pain much better. Will complete 10-day course. Nausea has been intermittent for past month — 2-3 episodes per week, not related to meals. No vomiting until this week (1 episode). BP 132/83. Labs drawn today: K+ 5.8 — critically elevated, highest recorded. Creatinine 1.0 (stable so kidneys OK). This confirms need to switch off Lisinopril. Discussed with patient — will transition to Losartan 50mg daily at next visit once ear infection fully resolved. Copper still low at 62. Nausea workup: ordered H. pylori breath test and upper GI series if persists. Added problem list: nausea with vomiting.",
-    tags: ["Prescription", "Lab Review", "Blood Work"],
-    actions: ["Ear abscess improving — complete Doxycycline course", "K+ 5.8 — critically elevated, plan ACE→ARB switch", "Losartan 50mg to replace Lisinopril (at next visit)", "Nausea workup: H. pylori breath test ordered", "Copper 62 — continue monitoring", "Problem list updated: nausea with vomiting", "Follow-up in 3 weeks"],
-  },
-];
-
-/* ─── Tag styling (light theme, inline styles) ─── */
-const TAG_COLORS: Record<string, { bg: string; color: string; border: string }> = {
-  "Prescription":  { bg: "#f5f3ff", color: "#7c3aed", border: "#ddd6fe" },
-  "Lab Order":     { bg: "#eff6ff", color: "#2563eb", border: "#bfdbfe" },
-  "Lab Work":      { bg: "#eff6ff", color: "#2563eb", border: "#bfdbfe" },
-  "Lab Review":    { bg: "#eff6ff", color: "#2563eb", border: "#bfdbfe" },
-  "Blood Work":    { bg: "#fff1f2", color: "#e11d48", border: "#fecdd3" },
-  "X-Ray":         { bg: "#ecfeff", color: "#0891b2", border: "#a5f3fc" },
-  "Imaging":       { bg: "#ecfeff", color: "#0891b2", border: "#a5f3fc" },
-  "Fever":         { bg: "#fff7ed", color: "#ea580c", border: "#fed7aa" },
-  "Referral":      { bg: "#fffbeb", color: "#d97706", border: "#fde68a" },
-  "ECG":           { bg: "#eef2ff", color: "#4f46e5", border: "#c7d2fe" },
-  "Echo":          { bg: "#eef2ff", color: "#4f46e5", border: "#c7d2fe" },
-  "Vaccination":   { bg: "#ecfdf5", color: "#059669", border: "#a7f3d0" },
-  "Screening":     { bg: "#f0fdfa", color: "#0d9488", border: "#99f6e4" },
-};
-const getTagStyle = (tag: string) => TAG_COLORS[tag] || { bg: "#f8fafc", color: "#64748b", border: "#e2e8f0" };
-
-/* ─── Note AI response builder (Gord Sims) ─── */
-const buildNotesResponse = (query: string) => {
-  const q = query.toLowerCase();
-  const allNotes = VISIT_NOTES;
-
-  if (q.includes("prescription") || q.includes("rx") || q.includes("prescrib") || q.includes("medication history")) {
-    const rxNotes = allNotes.filter(n => n.tags.includes("Prescription"));
-    return {
-      type: "notes_answer",
-      title: "Prescription History — Gord Sims",
-      content: rxNotes.map(n => `**${n.date}** — ${n.provider}: ${n.actions.filter(a => a.toLowerCase().startsWith("rx:") || a.toLowerCase().includes("increased") || a.toLowerCase().includes("refill") || a.toLowerCase().includes("continue")).join("; ") || n.chief}`).join("\n\n"),
-      details: `Found ${rxNotes.length} visits with prescription activity across ${allNotes.length} total visit notes.`,
-      noteCount: rxNotes.length,
-    };
-  }
-
-  if (q.includes("x-ray") || q.includes("xray") || q.includes("imaging") || q.includes("scan") || q.includes("ct")) {
-    const imgNotes = allNotes.filter(n => n.tags.includes("X-Ray") || n.tags.includes("Imaging") || n.tags.includes("Echo"));
-    return {
-      type: "notes_answer",
-      title: "Imaging & Diagnostic History",
-      content: imgNotes.map(n => `**${n.date}** (${n.type}) — ${n.actions.filter(a => a.toLowerCase().includes("x-ray") || a.toLowerCase().includes("echo") || a.toLowerCase().includes("ct")).join("; ")}`).join("\n\n"),
-      details: `Found ${imgNotes.length} visits involving imaging or diagnostic studies. Key findings: Echo EF 60% (Aug 2024), CT abdomen unremarkable (May 2025), Chest X-ray shows early emphysema (Aug 2025).`,
-      noteCount: imgNotes.length,
-    };
-  }
-
-  if (q.includes("fever") || q.includes("urgent") || q.includes("sick") || q.includes("emergency") || q.includes("acute")) {
-    const urgentNotes = allNotes.filter(n => n.type.includes("Urgent") || n.type.includes("Acute") || n.tags.includes("Fever"));
-    return {
-      type: "notes_answer",
-      title: "Urgent & Acute Visits",
-      content: urgentNotes.map(n => `**${n.date}** — ${n.chief}\n${n.summary.substring(0, 180)}...`).join("\n\n"),
-      details: `Found ${urgentNotes.length} urgent or acute visits: pericarditis (Aug 2024), abdominal pain (Mar 2025), and ear abscess (Dec 2025).`,
-      noteCount: urgentNotes.length,
-    };
-  }
-
-  if (q.includes("heart") || q.includes("cardiac") || q.includes("pericarditis") || q.includes("chest pain") || q.includes("echo") || q.includes("ecg")) {
-    const cardiacNotes = allNotes.filter(n => n.tags.includes("ECG") || n.tags.includes("Echo") || n.summary.toLowerCase().includes("pericarditis") || n.summary.toLowerCase().includes("cardiac"));
-    return {
-      type: "notes_answer",
-      title: "Cardiac History Timeline",
-      content: cardiacNotes.map(n => `**${n.date}** (${n.type}, ${n.provider}) — ${n.chief}\n${n.actions.join("; ")}`).join("\n\n"),
-      details: `Found ${cardiacNotes.length} cardiac-related visits. Pericarditis diagnosed Aug 2024, treated with colchicine + aspirin, resolved by Nov 2024. Echo EF 60%, no effusion.`,
-      noteCount: cardiacNotes.length,
-    };
-  }
-
-  if (q.includes("potassium") || q.includes("kidney") || q.includes("renal") || q.includes("k+") || q.includes("hyperkal")) {
-    const renalNotes = allNotes.filter(n => n.summary.toLowerCase().includes("k+") || n.summary.toLowerCase().includes("potassium") || n.summary.toLowerCase().includes("creatinine"));
-    return {
-      type: "notes_answer",
-      title: "Potassium & Renal Trend",
-      content: renalNotes.map(n => {
-        const kMatch = n.summary.match(/K\+?\s*(\d+\.?\d*)/i);
-        return `**${n.date}** — K+: ${kMatch ? kMatch[1] : "N/A"}`;
-      }).join("\n\n"),
-      details: `Potassium has trended: 4.6 (Mar 2024) → 4.8 → 5.0 → 5.1 → 5.2 → 5.4 → 5.5 → 5.8 (Jan 2026). Critically elevated on ACE inhibitor. Plan to switch Lisinopril → Losartan.`,
-      noteCount: renalNotes.length,
-    };
-  }
-
-  if (q.includes("ear") || q.includes("abscess") || q.includes("doxycycline") || q.includes("infection")) {
-    const earNotes = allNotes.filter(n => n.summary.toLowerCase().includes("ear") || n.summary.toLowerCase().includes("abscess"));
-    return {
-      type: "notes_answer",
-      title: "Ear Abscess History",
-      content: earNotes.map(n => `**${n.date}** (${n.type}) — ${n.chief}\n${n.actions.join("; ")}`).join("\n\n"),
-      details: `Ear abscess diagnosed Dec 2025. Treated with Doxycycline 100mg BID (Penicillin allergy). Improving at Jan 2026 follow-up.`,
-      noteCount: earNotes.length,
-    };
-  }
-
-  if (q.includes("abdomen") || q.includes("nausea") || q.includes("vomit") || q.includes("stomach") || q.includes("gi") || q.includes("celiac") || q.includes("gluten")) {
-    const giNotes = allNotes.filter(n => n.summary.toLowerCase().includes("abdominal") || n.summary.toLowerCase().includes("nausea") || n.summary.toLowerCase().includes("celiac") || n.summary.toLowerCase().includes("gluten"));
-    return {
-      type: "notes_answer",
-      title: "GI / Abdominal History",
-      content: giNotes.map(n => `**${n.date}** (${n.type}) — ${n.chief}\n${n.actions.join("; ")}`).join("\n\n"),
-      details: `Abdominal pain since Mar 2025, likely related to gluten sensitivity (tTG-IgA mildly elevated). CT unremarkable. GF diet helping. Nausea persisting since late 2025 — H. pylori workup pending.`,
-      noteCount: giNotes.length,
-    };
-  }
-
-  // ── Patient Info queries ──
-  if (q.includes("allerg")) {
-    return {
-      type: "notes_answer",
-      title: "Allergies — Gord Sims",
-      content: PATIENT_INFO.allergies.map(a => `**${a.allergen}** (${a.type}) — ${a.reaction} [${a.severity}]`).join("\n\n"),
-      details: `${PATIENT_INFO.allergies.length} documented allergies. Penicillin allergy is relevant for antibiotic selection — currently on Doxycycline for ear abscess.`,
-      noteCount: PATIENT_INFO.allergies.length,
-    };
-  }
-
-  if (q.includes("insurance") || q.includes("billing") || q.includes("coverage") || q.includes("member id") || q.includes("policy")) {
-    const ins = PATIENT_INFO.insurance;
-    return {
-      type: "notes_answer",
-      title: "Insurance & Billing — Gord Sims",
-      content: Object.entries(ins).map(([k, v]) => `**${k}:** ${v}`).join("\n"),
-      details: "Insurance information on file and verified.",
-      noteCount: 1,
-    };
-  }
-
-  if (q.includes("demographic") || q.includes("contact") || q.includes("phone") || q.includes("email") || q.includes("address") || q.includes("emergency") || q.includes("personal info") || q.includes("date of birth") || q.includes("dob") || q.includes("age")) {
-    const p = PATIENT_INFO.personal;
-    return {
-      type: "notes_answer",
-      title: "Patient Demographics — Gord Sims",
-      content: Object.entries(p).map(([k, v]) => `**${k}:** ${v}`).join("\n"),
-      details: "Full demographic and contact information on file.",
-      noteCount: 1,
-    };
-  }
-
-  if (q.includes("social") || q.includes("smok") || q.includes("alcohol") || q.includes("drug use") || q.includes("occupation") || q.includes("exercise")) {
-    const s = PATIENT_INFO.social;
-    return {
-      type: "notes_answer",
-      title: "Social History — Gord Sims",
-      content: Object.entries(s).map(([k, v]) => `**${k}:** ${v}`).join("\n"),
-      details: "Former smoker with ~15 pack-years is a key risk factor for the early emphysema noted on chest X-ray (Aug 2025).",
-      noteCount: 1,
-    };
-  }
-
-  if (q.includes("mental health") || q.includes("phq") || q.includes("gad") || q.includes("depress") || q.includes("anxiety") || q.includes("sleep") || q.includes("stress")) {
-    const mh = PATIENT_INFO.mentalHealth;
-    return {
-      type: "notes_answer",
-      title: "Mental Health Screening — Gord Sims",
-      content: `**PHQ-9 (Depression):** ${mh.phq9.score}/27 — ${mh.phq9.label} (${mh.phq9.date})\n**GAD-7 (Anxiety):** ${mh.gad7.score}/21 — ${mh.gad7.label} (${mh.gad7.date})\n**Sleep:** ${mh.sleep}\n**Stress:** ${mh.stress}`,
-      details: "Scores are in the minimal range. Moderate work-related stress noted. No pharmacotherapy indicated at this time.",
-      noteCount: 1,
-    };
-  }
-
-  if (q.includes("consent") || q.includes("hipaa") || q.includes("legal") || q.includes("release") || q.includes("telehealth consent")) {
-    return {
-      type: "notes_answer",
-      title: "Consent & Legal Forms — Gord Sims",
-      content: PATIENT_INFO.consent.map(c => `**${c.form}:** ${c.status} — ${c.date}`).join("\n"),
-      details: "All required consent forms are signed and on file.",
-      noteCount: PATIENT_INFO.consent.length,
-    };
-  }
-
-  if (q.includes("payment") || q.includes("copay") || q.includes("card on file") || q.includes("billing info")) {
-    return {
-      type: "notes_answer",
-      title: "Payment Information — Gord Sims",
-      content: Object.entries(PATIENT_INFO.payment).map(([k, v]) => `**${k}:** ${v}`).join("\n"),
-      details: "Payment method verified and on file.",
-      noteCount: 1,
-    };
-  }
-
-  if (q.includes("reason for visit") || q.includes("chief complaint") || q.includes("pain scale") || q.includes("why is he here") || q.includes("symptoms today")) {
-    return {
-      type: "notes_answer",
-      title: "Reason for Visit — Gord Sims",
-      content: Object.entries(PATIENT_INFO.reasonForVisit).map(([k, v]) => `**${k}:** ${v}`).join("\n"),
-      details: "Follow-up visit for hypertension and diabetes management. Mild ear discomfort is resolving with current Doxycycline course.",
-      noteCount: 1,
-    };
-  }
-
-  if (q.includes("chronic") || q.includes("condition") || q.includes("diagnos") || q.includes("surgery") || q.includes("hospital") || q.includes("family history") || q.includes("medical history")) {
-    const mh = PATIENT_INFO.medicalHistory;
-    return {
-      type: "notes_answer",
-      title: "Medical History — Gord Sims",
-      content: `**Chronic Conditions:** ${mh.chronic.join(", ")}\n\n**Past Diagnoses:**\n${mh.pastDiagnoses.map(d => `- ${d.condition} (${d.year}) — ${d.status}`).join("\n")}\n\n**Surgeries:**\n${mh.surgeries.map(s => `- ${s.procedure} (${s.year}) — ${s.notes}`).join("\n")}\n\n**Hospitalizations:**\n${mh.hospitalizations.map(h => `- ${h.reason} — ${h.date}, ${h.facility}`).join("\n")}\n\n**Family History:**\n${mh.familyHistory.map(f => `- ${f.relation}: ${f.conditions}`).join("\n")}`,
-      details: "Key concerns: Hypertension managed with Lisinopril (pending switch to Losartan due to hyperkalemia), early COPD from smoking history, and resolved pericarditis.",
-      noteCount: 1,
-    };
-  }
-
-  if (q.includes("summary") || q.includes("overview") || q.includes("everything") || q.includes("full profile") || q.includes("tell me about") || q.includes("who is")) {
-    const p = PATIENT_INFO.personal;
-    const mh = PATIENT_INFO.medicalHistory;
-    return {
-      type: "notes_answer",
-      title: "Patient Summary — Gord Sims",
-      content: `**${p["Full Legal Name"]}**, ${p["Date of Birth"]} (${p["Gender"]})\n${p["Address"]}\n\n**Chronic Conditions:** ${mh.chronic.join(", ")}\n**Allergies:** ${PATIENT_INFO.allergies.map(a => `${a.allergen} (${a.severity})`).join(", ")}\n**Current Medications:** ${PATIENT_INFO.medications.map(m => `${m.name} ${m.dose}`).join(", ")}\n\n**Recent:** K+ elevated at 5.8 — switching Lisinopril to Losartan. Ear abscess resolving on Doxycycline. Early emphysema on imaging.\n\n**${allNotes.length} visit notes** on file spanning Feb 2024 – Jan 2026.`,
-      details: "Ask about any specific area: allergies, insurance, medications, mental health, visit history, imaging, labs, or social history.",
-      noteCount: allNotes.length,
-    };
-  }
-
-  const recentNotes = allNotes.slice(-5);
-  return {
-    type: "notes_answer",
-    title: "Visit History Overview — Gord Sims",
-    content: `Gord Sims has **${allNotes.length} documented visits** spanning **${allNotes[0].date}** to **${allNotes[allNotes.length - 1].date}** (2 years).\n\n**Key milestones:**\n• Feb 2024: Hypertension diagnosed, started Lisinopril\n• Aug 2024: Pericarditis — treated, resolved by Nov 2024\n• Mar 2025: Abdominal pain → possible celiac disease\n• Aug 2025: Chest X-ray — early emphysema (former smoker)\n• Dec 2025: Ear abscess → Doxycycline\n• Jan 2026: K+ critically elevated at 5.8 — ACE→ARB switch planned\n\n**Most recent visits:**\n${recentNotes.map(n => `• ${n.date}: ${n.type} — ${n.chief}`).join("\n")}`,
-    details: `Ask about specific topics: prescriptions, imaging, cardiac history, potassium trend, ear abscess, GI issues, or any specific visit.`,
-    noteCount: recentNotes.length,
-  };
-};
+/* Data constants imported from @/lib/patient-data */
 
 const SeverityBadge = ({ level }: { level: string }) => {
   const styles: Record<string, React.CSSProperties> = {
@@ -636,7 +249,7 @@ const TypingIndicator = () => (
     {[0, 150, 300].map(delay => (
       <div key={delay} style={{ width: 6, height: 6, borderRadius: "50%", background: "#94a3b8", animation: "bounce 1s infinite", animationDelay: `${delay}ms` }} />
     ))}
-    <span style={{ fontSize: 11, color: "#9ca3af", marginLeft: 6 }}>Querying OpenEMR FHIR endpoint...</span>
+    <span style={{ fontSize: 11, color: "#9ca3af", marginLeft: 6 }}>Analyzing patient records...</span>
   </div>
 );
 
@@ -645,10 +258,12 @@ const CalendarView = ({
   appointments,
   onBook,
   onCancel,
+  selectedPatientId,
 }: {
   appointments: Appointment[];
   onBook: (date: string, time: string, type: string) => void;
   onCancel: (id: string) => void;
+  selectedPatientId: string;
 }) => {
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const [bookingSlot, setBookingSlot] = useState<string | null>(null);
@@ -680,7 +295,7 @@ const CalendarView = ({
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
         <div>
           <h2 style={{ fontSize: 20, fontWeight: 600, color: "#1e293b", margin: 0 }}>Appointments</h2>
-          <p style={{ fontSize: 13, color: "#9ca3af", marginTop: 4 }}>Book and manage appointments for Gord Sims</p>
+          <p style={{ fontSize: 13, color: "#9ca3af", marginTop: 4 }}>Book and manage appointments for {DEMO_PATIENTS.find(p => p.id === selectedPatientId)?.name ?? "patient"}</p>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <button onClick={() => setViewMonth(m => Math.max(1, m - 1))} disabled={viewMonth <= 1} style={{ width: 32, height: 32, borderRadius: 8, border: "1px solid #e2e8f0", background: "#fff", cursor: viewMonth <= 1 ? "not-allowed" : "pointer", opacity: viewMonth <= 1 ? 0.3 : 1, fontSize: 14, color: "#64748b" }}>←</button>
@@ -712,8 +327,8 @@ const CalendarView = ({
               const isWeekend = dow === 0 || dow === 6;
               const isSelected = selectedDate === dateStr;
               const dayApts = aptsForDay(day);
-              const myApts = dayApts.filter(a => a.patientId === "gord-sims");
-              const otherApts = dayApts.filter(a => a.patientId !== "gord-sims");
+              const myApts = dayApts.filter(a => a.patientId === selectedPatientId);
+              const otherApts = dayApts.filter(a => a.patientId !== selectedPatientId);
               const isToday = dateStr === "2026-02-23";
 
               return (
@@ -770,7 +385,7 @@ const CalendarView = ({
                 <div style={{ maxHeight: 420, overflowY: "auto", padding: "8px 0" }} className="scrollbar-thin">
                   {TIME_SLOTS.map(slot => {
                     const apt = selectedApts.find(a => a.time === slot);
-                    const isMine = apt?.patientId === "gord-sims";
+                    const isMine = apt?.patientId === selectedPatientId;
                     const isTaken = !!apt;
                     const isBooking = bookingSlot === slot;
 
@@ -816,7 +431,7 @@ const CalendarView = ({
 
           {/* My Upcoming Appointments */}
           {(() => {
-            const myApts = appointments.filter(a => a.patientId === "gord-sims").sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time));
+            const myApts = appointments.filter(a => a.patientId === selectedPatientId).sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time));
             if (myApts.length === 0) return null;
             return (
               <div style={{ marginTop: 16, background: "#fff", borderRadius: 12, border: "1px solid #e5e7eb", overflow: "hidden" }}>
@@ -844,7 +459,7 @@ const CalendarView = ({
 };
 
 /* ─── Visit Notes View Component ─── */
-const VisitNotesView = () => {
+const VisitNotesView = ({ visitNotes }: { visitNotes: typeof DEMO_VISIT_NOTES }) => {
   const [expandedNote, setExpandedNote] = useState<string | null>(null);
 
   return (
@@ -859,7 +474,7 @@ const VisitNotesView = () => {
       <div style={{ display: "flex", gap: 12, marginBottom: 24, flexWrap: "wrap" }}>
         <div style={{ background: "#ecfdf5", border: "1px solid #d1fae5", borderRadius: 10, padding: "8px 16px" }}>
           <div style={{ fontSize: 10, color: "#6b7280", textTransform: "uppercase", letterSpacing: 0.5 }}>Total Visits</div>
-          <div style={{ fontSize: 18, fontWeight: 700, color: "#059669" }}>{VISIT_NOTES.length}</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: "#059669" }}>{visitNotes.length}</div>
         </div>
         <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 10, padding: "8px 16px" }}>
           <div style={{ fontSize: 10, color: "#6b7280", textTransform: "uppercase", letterSpacing: 0.5 }}>Date Range</div>
@@ -871,7 +486,7 @@ const VisitNotesView = () => {
         </div>
         <div style={{ background: "#fff7ed", border: "1px solid #fed7aa", borderRadius: 10, padding: "8px 16px" }}>
           <div style={{ fontSize: 10, color: "#6b7280", textTransform: "uppercase", letterSpacing: 0.5 }}>Urgent Visits</div>
-          <div style={{ fontSize: 18, fontWeight: 700, color: "#ea580c" }}>{VISIT_NOTES.filter(n => n.type.includes("Urgent") || n.type.includes("Acute")).length}</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: "#ea580c" }}>{visitNotes.filter(n => n.type.includes("Urgent") || n.type.includes("Acute")).length}</div>
         </div>
       </div>
 
@@ -881,7 +496,7 @@ const VisitNotesView = () => {
         <div style={{ position: "absolute", left: 7, top: 10, bottom: 10, width: 2, background: "#e2e8f0", borderRadius: 1 }} />
 
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {[...VISIT_NOTES].reverse().map((note) => {
+          {[...visitNotes].reverse().map((note) => {
             const isExpanded = expandedNote === note.id;
             const dateObj = new Date(note.date + "T12:00:00");
             const monthStr = dateObj.toLocaleDateString("en-US", { month: "short" });
@@ -983,116 +598,9 @@ const VisitNotesView = () => {
   );
 };
 
-/* ─── Staff Data ─── */
-const STAFF = {
-  doctors: [
-    { name: "Dr. Raj Patel", title: "Primary Care Physician", specialty: "Internal Medicine", bio: "Board-certified internist with 18 years of experience in primary care and chronic disease management. Special interest in diabetes, hypertension, and preventive medicine. Completed residency at Johns Hopkins." },
-    { name: "Dr. Susan Kim", title: "Cardiologist", specialty: "Cardiology", bio: "Fellowship-trained cardiologist specializing in arrhythmia management and echocardiography. 12 years in practice. Passionate about patient education and heart disease prevention." },
-    { name: "Dr. Michael Torres", title: "Pulmonologist", specialty: "Pulmonology", bio: "Specializes in COPD, asthma, and interstitial lung disease. 10 years of experience. Active in clinical research on early emphysema detection and smoking cessation programs." },
-  ],
-  nurses: [
-    { name: "Jessica Hernandez", title: "Charge Nurse, RN", specialty: "Primary Care", bio: "Lead nurse with 14 years of experience in outpatient clinical settings. Coordinates patient triage, medication management, and care plan follow-ups." },
-    { name: "David Okonkwo", title: "Registered Nurse, RN", specialty: "Cardiology", bio: "Cardiac-certified nurse specializing in anticoagulation monitoring and post-procedure care. 9 years of experience in cardiology clinics." },
-    { name: "Emily Tran", title: "Registered Nurse, RN", specialty: "Chronic Care", bio: "Focused on diabetes education and chronic disease management. Certified Diabetes Educator (CDE). Helps patients with glucose monitoring and lifestyle coaching." },
-    { name: "Marcus Johnson", title: "Registered Nurse, RN", specialty: "Urgent Care", bio: "Experienced in acute care triage and wound management. 11 years in emergency and urgent care settings. Calm under pressure." },
-    { name: "Priya Sharma", title: "Licensed Practical Nurse", specialty: "Lab & Vitals", bio: "Skilled in phlebotomy, vital signs, and point-of-care testing. 6 years of experience. Patients appreciate her gentle technique and warm demeanor." },
-    { name: "Rachel Nguyen", title: "Registered Nurse, RN", specialty: "Pulmonology", bio: "Specializes in pulmonary function testing and respiratory care. 7 years of experience. Certified in spirometry and patient breathing education." },
-  ],
-  receptionists: [
-    { name: "Sarah Mitchell", title: "Front Desk Manager", specialty: "Operations", bio: "Manages patient scheduling, insurance verification, and front office operations. 10 years in healthcare administration. Keeps the clinic running smoothly." },
-    { name: "Carlos Vega", title: "Patient Coordinator", specialty: "Scheduling", bio: "Handles appointment booking, referral coordination, and patient communications. Known for his friendly phone manner and attention to detail. 5 years with the clinic." },
-    { name: "Amanda Foster", title: "Medical Receptionist", specialty: "Records & Intake", bio: "Manages patient check-in, medical records requests, and new patient intake paperwork. 4 years of experience. Always greets patients with a smile." },
-  ],
-};
-
-/* ─── Patient Personal Info ─── */
-const PATIENT_INFO = {
-  personal: {
-    "Full Legal Name": "Gord Allen Sims",
-    "Date of Birth": "January 25, 1967",
-    "Age": "59 years old",
-    "Sex": "Male",
-    "Gender": "Male",
-    "Marital Status": "Married",
-    "Preferred Language": "English",
-    "Phone": "(843) 831-5476",
-    "Email": "gord.sims@email.com",
-    "Address": "3517 Camden Place, New York, NY 10001",
-    "Emergency Contact": "Linda Sims (Wife) — (843) 831-5480",
-  },
-  insurance: {
-    "Insurance Provider": "Aetna",
-    "Member ID": "32523523023",
-    "Group Number": "GRP-88421",
-    "Policyholder": "Self (Gord A. Sims)",
-    "Policyholder DOB": "01/25/1967",
-    "Secondary Insurance": "None",
-    "Guarantor": "Self",
-    "Consent for Billing": "Yes — signed 02/08/2024",
-  },
-  medicalHistory: {
-    pastDiagnoses: [
-      { condition: "Pericarditis", status: "Resolved", year: "2024" },
-      { condition: "Urinary Tract Infection", status: "Resolved", year: "2025" },
-      { condition: "Possible Celiac Disease", status: "Under investigation", year: "2025" },
-    ],
-    surgeries: [{ procedure: "Appendectomy", year: "2003", notes: "Uncomplicated" }],
-    hospitalizations: [{ reason: "Acute Pericarditis — overnight observation", date: "Aug 2024", facility: "Northwest Valley Medical" }],
-    chronic: ["Hypertension (diagnosed Feb 2024)", "Early COPD / Emphysema (identified Aug 2025)", "Abdominal pain — gluten-related (ongoing)"],
-    familyHistory: [
-      { relation: "Father", conditions: "Hypertension, Myocardial Infarction at age 62" },
-      { relation: "Mother", conditions: "Type 2 Diabetes" },
-      { relation: "Brother", conditions: "Healthy, no known conditions" },
-    ],
-  },
-  medications: [
-    { name: "Enteric Coated Aspirin", dose: "325mg", freq: "Daily", purpose: "Cardioprotective", type: "Rx" },
-    { name: "Lisinopril", dose: "10mg", freq: "Daily", purpose: "Hypertension", type: "Rx" },
-    { name: "Doxycycline", dose: "100mg", freq: "BID", purpose: "Ear abscess (infection)", type: "Rx" },
-    { name: "Tylenol (Acetaminophen)", dose: "500mg", freq: "PRN", purpose: "Pain management", type: "OTC" },
-    { name: "Vitamin D3", dose: "2,000 IU", freq: "Daily", purpose: "Supplement", type: "Supplement" },
-    { name: "Fish Oil (Omega-3)", dose: "1,200mg", freq: "Daily", purpose: "Cardiovascular support", type: "Supplement" },
-  ],
-  allergies: [
-    { allergen: "Peanuts", type: "Food", reaction: "Anaphylaxis", severity: "Severe" },
-    { allergen: "Gluten", type: "Food", reaction: "GI distress, bloating", severity: "Moderate" },
-    { allergen: "Penicillin", type: "Drug", reaction: "Rash, hives", severity: "Moderate" },
-  ],
-  social: {
-    "Smoking / Tobacco": "Former smoker — quit 2019 (~15 pack-year history)",
-    "Alcohol Use": "Moderate — 2-3 beers per week",
-    "Recreational Drugs": "None",
-    "Occupation": "Office Administrator",
-    "Exercise": "Walking 20-30 minutes most days",
-  },
-  mentalHealth: {
-    phq9: { score: 4, label: "Minimal depression", date: "01/14/2026" },
-    gad7: { score: 3, label: "Minimal anxiety", date: "01/14/2026" },
-    sleep: "6-7 hours per night, occasional insomnia",
-    stress: "Moderate — primarily work-related",
-  },
-  reasonForVisit: {
-    "Chief Complaint": "Follow-up HTN management, ear abscess treatment",
-    "Duration": "Ongoing — hypertension since Feb 2024",
-    "Pain Scale": "2/10 — mild right ear discomfort",
-    "Associated Symptoms": "Intermittent nausea (2-3x/week), occasional headaches",
-  },
-  consent: [
-    { form: "Consent to Treat", status: "Signed", date: "02/08/2024" },
-    { form: "HIPAA Privacy Acknowledgment", status: "Signed", date: "02/08/2024" },
-    { form: "Financial Responsibility Agreement", status: "Signed", date: "02/08/2024" },
-    { form: "Telehealth Consent", status: "Signed", date: "03/12/2024" },
-    { form: "Release of Information", status: "On file", date: "02/08/2024" },
-  ],
-  payment: {
-    "Copay": "$25.00",
-    "Card on File": "Visa ending in 4821",
-    "Billing Preference": "Insurance primary, card on file for copay",
-  },
-};
 
 /* ─── Personal Info View Component ─── */
-const PersonalInfoView = () => {
+const PersonalInfoView = ({ patientInfo }: { patientInfo: typeof DEMO_PATIENT_INFO }) => {
   const sectionStyle = (accent: string): React.CSSProperties => ({
     background: "#ffffff",
     borderRadius: 14,
@@ -1133,7 +641,7 @@ const PersonalInfoView = () => {
             <h3 style={{ fontSize: 15, fontWeight: 600, color: "#1e293b", margin: 0 }}>Personal & Demographic Information</h3>
           </div>
           <div>
-            {entries(PATIENT_INFO.personal).map(([k, v], i, arr) => (
+            {entries(patientInfo.personal).map(([k, v], i, arr) => (
               <div key={k} style={rowStyle(i === arr.length - 1)}>
                 <span style={labelStyle}>{k}</span>
                 <span style={valueStyle}>{v}</span>
@@ -1147,7 +655,7 @@ const PersonalInfoView = () => {
             <h3 style={{ fontSize: 15, fontWeight: 600, color: "#1e293b", margin: 0 }}>Insurance & Billing Details</h3>
           </div>
           <div>
-            {entries(PATIENT_INFO.insurance).map(([k, v], i, arr) => (
+            {entries(patientInfo.insurance).map(([k, v], i, arr) => (
               <div key={k} style={rowStyle(i === arr.length - 1)}>
                 <span style={labelStyle}>{k}</span>
                 <span style={valueStyle}>{v}</span>
@@ -1168,7 +676,7 @@ const PersonalInfoView = () => {
             <div style={{ marginBottom: 16 }}>
               <p style={{ fontSize: 11, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase", letterSpacing: 0.5, margin: "0 0 8px" }}>Past Diagnoses</p>
               <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                {PATIENT_INFO.medicalHistory.pastDiagnoses.map(d => (
+                {patientInfo.medicalHistory.pastDiagnoses.map(d => (
                   <div key={d.condition} style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <span style={{ fontSize: 13, color: "#1e293b", fontWeight: 500 }}>{d.condition}</span>
                     <span style={{ fontSize: 10, fontWeight: 600, padding: "2px 8px", borderRadius: 999, background: d.status === "Resolved" ? "#ecfdf5" : "#fffbeb", color: d.status === "Resolved" ? "#059669" : "#d97706", border: `1px solid ${d.status === "Resolved" ? "#a7f3d0" : "#fde68a"}` }}>{d.status}</span>
@@ -1180,21 +688,21 @@ const PersonalInfoView = () => {
             {/* Surgeries */}
             <div style={{ marginBottom: 16 }}>
               <p style={{ fontSize: 11, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase", letterSpacing: 0.5, margin: "0 0 8px" }}>Surgeries</p>
-              {PATIENT_INFO.medicalHistory.surgeries.map(s => (
+              {patientInfo.medicalHistory.surgeries.map(s => (
                 <p key={s.procedure} style={{ fontSize: 13, color: "#1e293b", margin: 0 }}>{s.procedure} <span style={{ color: "#9ca3af" }}>({s.year}) — {s.notes}</span></p>
               ))}
             </div>
             {/* Hospitalizations */}
             <div style={{ marginBottom: 16 }}>
               <p style={{ fontSize: 11, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase", letterSpacing: 0.5, margin: "0 0 8px" }}>Hospitalizations</p>
-              {PATIENT_INFO.medicalHistory.hospitalizations.map(h => (
+              {patientInfo.medicalHistory.hospitalizations.map(h => (
                 <p key={h.reason} style={{ fontSize: 13, color: "#1e293b", margin: 0 }}>{h.reason} <span style={{ color: "#9ca3af" }}>— {h.date}, {h.facility}</span></p>
               ))}
             </div>
             {/* Chronic conditions */}
             <div style={{ marginBottom: 16 }}>
               <p style={{ fontSize: 11, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase", letterSpacing: 0.5, margin: "0 0 8px" }}>Chronic Conditions</p>
-              {PATIENT_INFO.medicalHistory.chronic.map(c => (
+              {patientInfo.medicalHistory.chronic.map(c => (
                 <div key={c} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
                   <div style={{ width: 5, height: 5, borderRadius: "50%", background: "#f59e0b", flexShrink: 0 }} />
                   <span style={{ fontSize: 13, color: "#1e293b" }}>{c}</span>
@@ -1204,7 +712,7 @@ const PersonalInfoView = () => {
             {/* Family history */}
             <div>
               <p style={{ fontSize: 11, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase", letterSpacing: 0.5, margin: "0 0 8px" }}>Family Medical History</p>
-              {PATIENT_INFO.medicalHistory.familyHistory.map(f => (
+              {patientInfo.medicalHistory.familyHistory.map(f => (
                 <div key={f.relation} style={{ display: "grid", gridTemplateColumns: "80px 1fr", padding: "4px 0" }}>
                   <span style={{ fontSize: 12, color: "#64748b", fontWeight: 600 }}>{f.relation}</span>
                   <span style={{ fontSize: 13, color: "#1e293b" }}>{f.conditions}</span>
@@ -1224,34 +732,34 @@ const PersonalInfoView = () => {
               <div style={{ padding: "12px 16px", borderRadius: 10, background: "#f8fafc", border: "1px solid #e2e8f0" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
                   <span style={{ fontSize: 12, fontWeight: 600, color: "#1e293b" }}>PHQ-9 (Depression)</span>
-                  <span style={{ fontSize: 18, fontWeight: 700, color: "#10b981" }}>{PATIENT_INFO.mentalHealth.phq9.score}</span>
+                  <span style={{ fontSize: 18, fontWeight: 700, color: "#10b981" }}>{patientInfo.mentalHealth.phq9.score}</span>
                 </div>
                 <div style={{ width: "100%", height: 4, borderRadius: 2, background: "#e2e8f0" }}>
-                  <div style={{ width: `${(PATIENT_INFO.mentalHealth.phq9.score / 27) * 100}%`, height: "100%", borderRadius: 2, background: "#10b981" }} />
+                  <div style={{ width: `${(patientInfo.mentalHealth.phq9.score / 27) * 100}%`, height: "100%", borderRadius: 2, background: "#10b981" }} />
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6 }}>
-                  <span style={{ fontSize: 11, color: "#10b981", fontWeight: 500 }}>{PATIENT_INFO.mentalHealth.phq9.label}</span>
-                  <span style={{ fontSize: 10, color: "#9ca3af" }}>{PATIENT_INFO.mentalHealth.phq9.date}</span>
+                  <span style={{ fontSize: 11, color: "#10b981", fontWeight: 500 }}>{patientInfo.mentalHealth.phq9.label}</span>
+                  <span style={{ fontSize: 10, color: "#9ca3af" }}>{patientInfo.mentalHealth.phq9.date}</span>
                 </div>
               </div>
               {/* GAD-7 */}
               <div style={{ padding: "12px 16px", borderRadius: 10, background: "#f8fafc", border: "1px solid #e2e8f0" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
                   <span style={{ fontSize: 12, fontWeight: 600, color: "#1e293b" }}>GAD-7 (Anxiety)</span>
-                  <span style={{ fontSize: 18, fontWeight: 700, color: "#10b981" }}>{PATIENT_INFO.mentalHealth.gad7.score}</span>
+                  <span style={{ fontSize: 18, fontWeight: 700, color: "#10b981" }}>{patientInfo.mentalHealth.gad7.score}</span>
                 </div>
                 <div style={{ width: "100%", height: 4, borderRadius: 2, background: "#e2e8f0" }}>
-                  <div style={{ width: `${(PATIENT_INFO.mentalHealth.gad7.score / 21) * 100}%`, height: "100%", borderRadius: 2, background: "#10b981" }} />
+                  <div style={{ width: `${(patientInfo.mentalHealth.gad7.score / 21) * 100}%`, height: "100%", borderRadius: 2, background: "#10b981" }} />
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6 }}>
-                  <span style={{ fontSize: 11, color: "#10b981", fontWeight: 500 }}>{PATIENT_INFO.mentalHealth.gad7.label}</span>
-                  <span style={{ fontSize: 10, color: "#9ca3af" }}>{PATIENT_INFO.mentalHealth.gad7.date}</span>
+                  <span style={{ fontSize: 11, color: "#10b981", fontWeight: 500 }}>{patientInfo.mentalHealth.gad7.label}</span>
+                  <span style={{ fontSize: 10, color: "#9ca3af" }}>{patientInfo.mentalHealth.gad7.date}</span>
                 </div>
               </div>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "180px 1fr", gap: "6px 0" }}>
-              <span style={labelStyle}>Sleep</span><span style={valueStyle}>{PATIENT_INFO.mentalHealth.sleep}</span>
-              <span style={labelStyle}>Stress Level</span><span style={valueStyle}>{PATIENT_INFO.mentalHealth.stress}</span>
+              <span style={labelStyle}>Sleep</span><span style={valueStyle}>{patientInfo.mentalHealth.sleep}</span>
+              <span style={labelStyle}>Stress Level</span><span style={valueStyle}>{patientInfo.mentalHealth.stress}</span>
             </div>
           </div>
         </div>
@@ -1270,7 +778,7 @@ const PersonalInfoView = () => {
             <span style={{ fontSize: 10, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase" }}>Purpose</span>
             <span style={{ fontSize: 10, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase" }}>Type</span>
           </div>
-          {PATIENT_INFO.medications.map(med => (
+          {patientInfo.medications.map(med => (
             <div key={med.name} style={{ display: "grid", gridTemplateColumns: "1fr 80px 70px 1fr 80px", padding: "10px 20px", borderBottom: "1px solid #fafbfc", alignItems: "center" }}>
               <span style={{ fontSize: 13, color: "#1e293b", fontWeight: 500 }}>{med.name}</span>
               <span style={{ fontSize: 12, color: "#64748b" }}>{med.dose}</span>
@@ -1289,7 +797,7 @@ const PersonalInfoView = () => {
             <h3 style={{ fontSize: 15, fontWeight: 600, color: "#1e293b", margin: 0 }}>Allergies</h3>
           </div>
           <div style={{ padding: "14px 20px", display: "flex", flexDirection: "column", gap: 10 }}>
-            {PATIENT_INFO.allergies.map(a => (
+            {patientInfo.allergies.map(a => (
               <div key={a.allergen} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", borderRadius: 10, background: a.severity === "Severe" ? "#fef2f2" : "#fffbeb", border: `1px solid ${a.severity === "Severe" ? "#fecaca" : "#fde68a"}` }}>
                 <div>
                   <span style={{ fontSize: 14, fontWeight: 600, color: "#1e293b" }}>{a.allergen}</span>
@@ -1309,7 +817,7 @@ const PersonalInfoView = () => {
             <h3 style={{ fontSize: 15, fontWeight: 600, color: "#1e293b", margin: 0 }}>Social History</h3>
           </div>
           <div>
-            {entries(PATIENT_INFO.social).map(([k, v], i, arr) => (
+            {entries(patientInfo.social).map(([k, v], i, arr) => (
               <div key={k} style={rowStyle(i === arr.length - 1)}>
                 <span style={labelStyle}>{k}</span>
                 <span style={valueStyle}>{v}</span>
@@ -1326,7 +834,7 @@ const PersonalInfoView = () => {
             <h3 style={{ fontSize: 15, fontWeight: 600, color: "#1e293b", margin: 0 }}>Reason for Visit / Symptoms</h3>
           </div>
           <div>
-            {entries(PATIENT_INFO.reasonForVisit).map(([k, v], i, arr) => (
+            {entries(patientInfo.reasonForVisit).map(([k, v], i, arr) => (
               <div key={k} style={rowStyle(i === arr.length - 1)}>
                 <span style={labelStyle}>{k}</span>
                 <span style={valueStyle}>{v}</span>
@@ -1340,7 +848,7 @@ const PersonalInfoView = () => {
             <h3 style={{ fontSize: 15, fontWeight: 600, color: "#1e293b", margin: 0 }}>Payment Information</h3>
           </div>
           <div>
-            {entries(PATIENT_INFO.payment).map(([k, v], i, arr) => (
+            {entries(patientInfo.payment).map(([k, v], i, arr) => (
               <div key={k} style={rowStyle(i === arr.length - 1)}>
                 <span style={labelStyle}>{k}</span>
                 <span style={valueStyle}>{v}</span>
@@ -1356,8 +864,8 @@ const PersonalInfoView = () => {
           <h3 style={{ fontSize: 15, fontWeight: 600, color: "#1e293b", margin: 0 }}>Consent & Legal Forms</h3>
         </div>
         <div style={{ padding: "10px 20px" }}>
-          {PATIENT_INFO.consent.map((c, i) => (
-            <div key={c.form} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: i === PATIENT_INFO.consent.length - 1 ? "none" : "1px solid #f8fafc" }}>
+          {patientInfo.consent.map((c, i) => (
+            <div key={c.form} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: i === patientInfo.consent.length - 1 ? "none" : "1px solid #f8fafc" }}>
               <div style={{ width: 20, height: 20, borderRadius: "50%", background: "#ecfdf5", border: "1px solid #a7f3d0", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                 <span style={{ fontSize: 11, color: "#059669" }}>✓</span>
               </div>
@@ -1510,36 +1018,1386 @@ const StaffView = () => {
   );
 };
 
+/* ─── TOOL 1: Drug Interaction Checker ─── */
+const DrugInteractionChecker = ({ medications, allergies, patientId, onToolResult }: {
+  medications: typeof DEMO_PATIENT_INFO.medications;
+  allergies: typeof DEMO_PATIENT_INFO.allergies;
+  patientId: string;
+  onToolResult: (entry: string) => void;
+}) => {
+  const [medChecklist, setMedChecklist] = useState<Record<string, boolean>>(() => {
+    const init: Record<string, boolean> = {};
+    medications.forEach(m => { init[m.name] = true; });
+    return init;
+  });
+  const [customMed, setCustomMed] = useState("");
+  const [customMeds, setCustomMeds] = useState<string[]>([]);
+  const [results, setResults] = useState("");
+  const [checking, setChecking] = useState(false);
+
+  const selectedCount = Object.values(medChecklist).filter(Boolean).length;
+
+  const toggleMed = (name: string) => {
+    setMedChecklist(prev => ({ ...prev, [name]: !prev[name] }));
+  };
+
+  const addCustomMed = () => {
+    const trimmed = customMed.trim();
+    if (!trimmed || customMeds.includes(trimmed)) return;
+    setCustomMeds(prev => [...prev, trimmed]);
+    setMedChecklist(prev => ({ ...prev, [trimmed]: true }));
+    setCustomMed("");
+  };
+
+  const removeCustomMed = (name: string) => {
+    setCustomMeds(prev => prev.filter(n => n !== name));
+    setMedChecklist(prev => {
+      const next = { ...prev };
+      delete next[name];
+      return next;
+    });
+  };
+
+  const checkInteractions = async () => {
+    const selected = Object.entries(medChecklist).filter(([, v]) => v).map(([k]) => k);
+    if (selected.length < 2) return;
+    setChecking(true);
+    setResults("");
+    try {
+      const prompt = `Analyze potential drug interactions between these medications: ${selected.join(", ")}.\n\nPatient allergies: ${allergies.map(a => `${a.allergen} (${a.reaction})`).join(", ")}.\n\nFor each interaction pair found:\n1. List the two drugs\n2. Severity (High/Moderate/Low)\n3. Mechanism of interaction\n4. Clinical recommendation\n\nAlso flag any allergy cross-reactivity concerns. Be thorough but concise.`;
+
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: [{ role: "user", content: prompt }], patientId }),
+      });
+      if (!res.ok) throw new Error("API error");
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder();
+      let fullText = "";
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          fullText += decoder.decode(value, { stream: true });
+          setResults(fullText);
+        }
+      }
+      // Log tool result for AI synthesis
+      onToolResult(`[Drug Interaction Check] Analyzed: ${selected.join(", ")}. Summary: ${fullText.slice(0, 300)}...`);
+    } catch {
+      setResults("Unable to check interactions. Please verify your API key is configured.");
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", gap: 24, padding: 24, height: "calc(100vh - 72px)", overflow: "hidden" }}>
+      {/* Left Panel — Medication Selection */}
+      <div style={{ width: 380, flexShrink: 0, display: "flex", flexDirection: "column", gap: 16, overflow: "auto" }}>
+        <div className="tool-panel" style={{ flex: 1 }}>
+          <div className="tool-panel-header">
+            <h3>Medication Selection</h3>
+            <span style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 600 }}>Selected: {selectedCount}</span>
+          </div>
+          <div className="tool-panel-body" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <label className="tool-label">Current Medications</label>
+            {medications.map(med => (
+              <div
+                key={med.name}
+                className={`tool-checkbox ${medChecklist[med.name] ? "checked" : ""}`}
+                onClick={() => toggleMed(med.name)}
+              >
+                <div className="tool-checkbox-box">
+                  {medChecklist[med.name] && (
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3"><polyline points="20 6 9 17 4 12"/></svg>
+                  )}
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>{med.name}</div>
+                  <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{med.dose} — {med.freq} — {med.purpose}</div>
+                </div>
+              </div>
+            ))}
+
+            {customMeds.length > 0 && (
+              <>
+                <label className="tool-label" style={{ marginTop: 8 }}>Custom Medications</label>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {customMeds.map(name => (
+                    <div key={name} className="med-pill">
+                      <div
+                        className={`tool-checkbox-box`}
+                        style={{ width: 16, height: 16, borderRadius: 4, cursor: "pointer" }}
+                        onClick={(e) => { e.stopPropagation(); toggleMed(name); }}
+                      >
+                        {medChecklist[name] && (
+                          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={medChecklist[name] ? "#fff" : "transparent"} strokeWidth="3"><polyline points="20 6 9 17 4 12"/></svg>
+                        )}
+                      </div>
+                      <span style={{ background: medChecklist[name] ? "var(--accent)" : "transparent" }} />
+                      {name}
+                      <button onClick={() => removeCustomMed(name)} title="Remove">&times;</button>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            <label className="tool-label" style={{ marginTop: 8 }}>Add Medication</label>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                className="tool-input"
+                placeholder="e.g. Warfarin, Metoprolol..."
+                value={customMed}
+                onChange={e => setCustomMed(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && addCustomMed()}
+              />
+              <button className="tool-btn-primary" onClick={addCustomMed} style={{ whiteSpace: "nowrap", padding: "10px 16px" }}>Add</button>
+            </div>
+
+            <button
+              className="tool-btn-primary"
+              style={{ width: "100%", marginTop: 12 }}
+              onClick={checkInteractions}
+              disabled={checking || selectedCount < 2}
+            >
+              {checking ? (
+                <><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ animation: "spin 1s linear infinite" }}><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>Analyzing...</>
+              ) : (
+                <><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>Check Interactions</>
+              )}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Right Panel — Results */}
+      <div style={{ flex: 1, overflow: "auto" }}>
+        <div className="tool-panel" style={{ minHeight: "100%" }}>
+          <div className="tool-panel-header">
+            <h3>Interaction Analysis</h3>
+          </div>
+          <div className="tool-panel-body">
+            {!results && !checking ? (
+              <div className="tool-empty-state">
+                <svg fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5M9.75 3.104c-.251.023-.501.05-.75.082m.75-.082a24.301 24.301 0 014.5 0m0 0v5.714a2.25 2.25 0 00.659 1.591L19 14.5M14.25 3.104c.251.023.501.05.75.082M19 14.5l-2.47 4.94a2.25 2.25 0 01-2.015 1.244H9.485a2.25 2.25 0 01-2.014-1.244L5 14.5m14 0H5"/></svg>
+                <p>Select medications and click <strong>Check Interactions</strong> to analyze potential drug-drug interactions using AI.</p>
+              </div>
+            ) : checking && !results ? (
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16, padding: 48 }}>
+                <TypingIndicator />
+                <p style={{ fontSize: 13, color: "var(--text-muted)" }}>Analyzing {selectedCount} medications for interactions...</p>
+              </div>
+            ) : (
+              <div style={{ lineHeight: 1.6 }}>
+                {renderAIText(results)}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* ─── TOOL 2: E-Prescribe Pad ─── */
+const EPrescribePad = ({ allergies, currentProvider, patientName, onToolResult }: {
+  allergies: typeof DEMO_PATIENT_INFO.allergies;
+  currentProvider: { name: string; specialty: string };
+  patientName: string;
+  onToolResult: (entry: string) => void;
+}) => {
+  const [drugSearch, setDrugSearch] = useState("");
+  const [selectedDrug, setSelectedDrug] = useState("");
+  const [dose, setDose] = useState("");
+  const [frequency, setFrequency] = useState("QD");
+  const [route, setRoute] = useState("PO");
+  const [duration, setDuration] = useState("");
+  const [instructions, setInstructions] = useState("");
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [queue, setQueue] = useState<PrescriptionItem[]>([]);
+  const [toast, setToast] = useState(false);
+  const searchRef = useRef<HTMLDivElement>(null);
+
+  const filteredMeds = COMMON_MEDICATIONS.filter(m =>
+    m.name.toLowerCase().includes(drugSearch.toLowerCase()) && drugSearch.length > 0
+  );
+
+  const allergyWarning = useMemo(() => {
+    if (!selectedDrug) return null;
+    // Direct match
+    const directMatch = allergies.find(a => a.type === "Drug" && selectedDrug.toLowerCase().includes(a.allergen.toLowerCase()));
+    if (directMatch) return { ...directMatch, matchType: "direct" as const };
+    // Penicillin class cross-reference
+    const isPenicillinAllergy = allergies.some(a => a.allergen.toLowerCase() === "penicillin");
+    if (isPenicillinAllergy && PENICILLIN_CLASS_DRUGS.some(d => d.toLowerCase() === selectedDrug.toLowerCase())) {
+      return { allergen: "Penicillin", type: "Drug", reaction: "Rash, hives", severity: "Moderate", matchType: "cross-reactivity" as const };
+    }
+    return null;
+  }, [selectedDrug, allergies]);
+
+  const selectDrug = (name: string) => {
+    setSelectedDrug(name);
+    setDrugSearch(name);
+    setShowSuggestions(false);
+    const doses = COMMON_DOSES[name];
+    if (doses && doses.length > 0) setDose(doses[0]);
+    // Check for allergy and log
+    const isPenAllergy = allergies.some(a => a.allergen.toLowerCase() === "penicillin");
+    const isPenDrug = PENICILLIN_CLASS_DRUGS.some(d => d.toLowerCase() === name.toLowerCase());
+    const directAllergy = allergies.find(a => a.type === "Drug" && name.toLowerCase().includes(a.allergen.toLowerCase()));
+    if (directAllergy || (isPenAllergy && isPenDrug)) {
+      onToolResult(`[E-Prescribe Allergy Alert] Drug "${name}" triggered allergy warning — patient has documented ${directAllergy?.allergen || "Penicillin"} allergy (${directAllergy?.reaction || "Rash, hives"}).`);
+    }
+  };
+
+  const addToQueue = () => {
+    if (!selectedDrug || !dose) return;
+    const item: PrescriptionItem = {
+      id: `rx-${Date.now()}`,
+      drug: selectedDrug,
+      dose,
+      frequency,
+      route,
+      duration: duration || "As directed",
+      instructions: instructions || "Take as directed",
+      addedAt: Date.now(),
+    };
+    setQueue(prev => [...prev, item]);
+    setSelectedDrug("");
+    setDrugSearch("");
+    setDose("");
+    setDuration("");
+    setInstructions("");
+  };
+
+  const removeFromQueue = (id: string) => {
+    setQueue(prev => prev.filter(item => item.id !== id));
+  };
+
+  const signAndSend = () => {
+    if (queue.length === 0) return;
+    const rxSummary = queue.map(q => `${q.drug} ${q.dose} ${q.frequency} ${q.route}`).join("; ");
+    onToolResult(`[E-Prescribe] Prescribed for ${patientName}: ${rxSummary}. Signed by Dr. ${currentProvider.name}.`);
+    setQueue([]);
+    setToast(true);
+    setTimeout(() => setToast(false), 4000);
+  };
+
+  // Close suggestions when clicking outside
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (searchRef.current && !searchRef.current.contains(e.target as Node)) {
+        setShowSuggestions(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  return (
+    <div style={{ display: "flex", gap: 24, padding: 24, height: "calc(100vh - 72px)", overflow: "hidden" }}>
+      {toast && (
+        <div className="toast-success">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+          Prescriptions signed and sent for {patientName}
+        </div>
+      )}
+
+      {/* Left Panel — Prescription Form */}
+      <div style={{ width: 400, flexShrink: 0, overflow: "auto" }}>
+        <div className="tool-panel">
+          <div className="tool-panel-header">
+            <h3>New Prescription</h3>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Dr. {currentProvider.name}</span>
+          </div>
+          <div className="tool-panel-body" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            {/* Drug Search */}
+            <div>
+              <label className="tool-label">Medication</label>
+              <div ref={searchRef} style={{ position: "relative" }}>
+                <input
+                  className="tool-input"
+                  placeholder="Search medications..."
+                  value={drugSearch}
+                  onChange={e => { setDrugSearch(e.target.value); setShowSuggestions(true); setSelectedDrug(""); }}
+                  onFocus={() => drugSearch.length > 0 && setShowSuggestions(true)}
+                />
+                {showSuggestions && filteredMeds.length > 0 && (
+                  <div className="autocomplete-dropdown">
+                    {filteredMeds.map(med => (
+                      <div key={med.name} className="autocomplete-item" onClick={() => selectDrug(med.name)}>
+                        <span className="autocomplete-item-name">{med.name}</span>
+                        <span className="autocomplete-item-category">{med.category}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Allergy Warning */}
+            {allergyWarning && (
+              <div className="allergy-warning">
+                <div className="allergy-warning-icon">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                </div>
+                <div className="allergy-warning-text">
+                  <div className="allergy-warning-title">
+                    Allergy Alert: {allergyWarning.allergen} {allergyWarning.matchType === "cross-reactivity" ? "(Cross-Reactivity)" : ""}
+                    <SeverityBadge level={allergyWarning.severity.toLowerCase() === "severe" ? "high" : "moderate"} />
+                  </div>
+                  <div className="allergy-warning-detail">Reaction: {allergyWarning.reaction}. Patient has documented {allergyWarning.allergen} allergy.</div>
+                </div>
+              </div>
+            )}
+
+            {/* Dose */}
+            <div>
+              <label className="tool-label">Dose</label>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  className="tool-input"
+                  placeholder="e.g. 500mg"
+                  value={dose}
+                  onChange={e => setDose(e.target.value)}
+                  style={{ flex: 1 }}
+                />
+                {selectedDrug && COMMON_DOSES[selectedDrug] && (
+                  <select className="tool-select" style={{ width: "auto", minWidth: 100 }} value={dose} onChange={e => setDose(e.target.value)}>
+                    {COMMON_DOSES[selectedDrug].map(d => (
+                      <option key={d} value={d}>{d}</option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            </div>
+
+            {/* Frequency + Route */}
+            <div style={{ display: "flex", gap: 12 }}>
+              <div style={{ flex: 1 }}>
+                <label className="tool-label">Frequency</label>
+                <select className="tool-select" value={frequency} onChange={e => setFrequency(e.target.value)}>
+                  {RX_FREQUENCIES.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
+                </select>
+              </div>
+              <div style={{ flex: 1 }}>
+                <label className="tool-label">Route</label>
+                <select className="tool-select" value={route} onChange={e => setRoute(e.target.value)}>
+                  {RX_ROUTES.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
+                </select>
+              </div>
+            </div>
+
+            {/* Duration */}
+            <div>
+              <label className="tool-label">Duration</label>
+              <input
+                className="tool-input"
+                placeholder="e.g. 7 days, 30 days, ongoing"
+                value={duration}
+                onChange={e => setDuration(e.target.value)}
+              />
+            </div>
+
+            {/* Instructions */}
+            <div>
+              <label className="tool-label">Instructions</label>
+              <textarea
+                className="tool-textarea"
+                placeholder="e.g. Take with food, avoid alcohol..."
+                value={instructions}
+                onChange={e => setInstructions(e.target.value)}
+              />
+            </div>
+
+            {/* Add to Queue */}
+            <button
+              className="tool-btn-primary"
+              style={{ width: "100%" }}
+              onClick={addToQueue}
+              disabled={!selectedDrug || !dose}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              Add to Queue
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Right Panel — Prescription Queue */}
+      <div style={{ flex: 1, overflow: "auto" }}>
+        <div className="tool-panel" style={{ minHeight: "100%" }}>
+          <div className="tool-panel-header">
+            <h3>Prescription Queue ({queue.length})</h3>
+            {queue.length > 0 && (
+              <button className="tool-btn-success" onClick={signAndSend}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                Sign &amp; Send All
+              </button>
+            )}
+          </div>
+          <div className="tool-panel-body">
+            {queue.length === 0 ? (
+              <div className="tool-empty-state">
+                <svg fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/></svg>
+                <p>No prescriptions in queue. Use the form to add medications.</p>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {queue.map(item => (
+                  <div key={item.id} className="rx-queue-item">
+                    <div className="rx-queue-item-header">
+                      <span className="rx-queue-item-drug">{item.drug}</span>
+                      <button className="tool-btn-danger" onClick={() => removeFromQueue(item.id)}>Remove</button>
+                    </div>
+                    <div className="rx-queue-item-details">
+                      {item.dose} &bull; {RX_FREQUENCIES.find(f => f.value === item.frequency)?.label || item.frequency} &bull; {RX_ROUTES.find(r => r.value === item.route)?.label || item.route}<br/>
+                      Duration: {item.duration} &bull; {item.instructions}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* ─── TOOL 3: ASCVD Risk Calculator ─── */
+const ASCVDRiskCalculator = ({ patientInfo, setChatOpen, setChatInput, onToolResult }: {
+  patientInfo: typeof DEMO_PATIENT_INFO;
+  setChatOpen: (v: boolean) => void;
+  setChatInput: (v: string) => void;
+  onToolResult: (entry: string) => void;
+}) => {
+  // Auto-populate from patient data (BP from last known vitals: 132/83 for Gord Sims)
+  const onBPMeds = patientInfo.medications?.some(m => m.name.toLowerCase().includes("lisinopril") || m.name.toLowerCase().includes("losartan") || m.purpose?.toLowerCase().includes("hypertension")) ?? false;
+  const isSmoker = patientInfo.social?.["Smoking / Tobacco"]?.toLowerCase().includes("former") || patientInfo.social?.["Smoking / Tobacco"]?.toLowerCase().includes("current") || false;
+
+  const [age, setAge] = useState(59);
+  const [sex, setSex] = useState<"male" | "female">("male");
+  const [totalChol, setTotalChol] = useState(210);
+  const [hdl, setHdl] = useState(45);
+  const [sbp, setSbp] = useState(132);
+  const [dbp, setDbp] = useState(83);
+  const [bpTreatment, setBpTreatment] = useState(onBPMeds);
+  const [smoker, setSmoker] = useState(isSmoker);
+  const [diabetes, setDiabetes] = useState(false);
+  const [riskResult, setRiskResult] = useState<{ risk: number; category: string; color: string } | null>(null);
+
+  const [calcError, setCalcError] = useState("");
+
+  const calculateRisk = () => {
+    setCalcError("");
+    // Input validation
+    if (age < 40 || age > 79) { setCalcError("Age must be between 40 and 79."); return; }
+    if (totalChol <= 0 || hdl <= 0 || sbp <= 0) { setCalcError("Cholesterol, HDL, and blood pressure must be positive values."); return; }
+    if (hdl >= totalChol) { setCalcError("HDL cannot be greater than total cholesterol."); return; }
+
+    // Pooled Cohort Equations (2013 ACC/AHA) — white race coefficients
+    const lnAge = Math.log(age);
+    const lnChol = Math.log(totalChol);
+    const lnHDL = Math.log(hdl);
+    const lnSBP = Math.log(sbp);
+    const smokerVal = smoker ? 1 : 0;
+    const diabetesVal = diabetes ? 1 : 0;
+
+    let sumCoeff: number;
+    let meanCoeff: number;
+    let baselineSurvival: number;
+
+    if (sex === "male") {
+      const lnSBPCoeff = bpTreatment ? 1.99881 : 1.93303;
+      sumCoeff = 12.344 * lnAge + 11.853 * lnChol + -2.664 * (lnAge * lnChol) +
+        -7.990 * lnHDL + 1.769 * (lnAge * lnHDL) +
+        lnSBPCoeff * lnSBP +
+        7.837 * smokerVal + -1.795 * (lnAge * smokerVal) +
+        0.658 * diabetesVal;
+      meanCoeff = 61.18;
+      baselineSurvival = 0.9144;
+    } else {
+      const lnSBPCoeff = bpTreatment ? 29.2907 : 27.8197;
+      sumCoeff = -29.799 * lnAge + 13.540 * (lnAge * lnAge) + 13.540 * lnChol +
+        -13.578 * (lnAge * lnChol) + -13.578 * lnHDL + 1.957 * (lnAge * lnHDL) +
+        lnSBPCoeff * lnSBP + -6.4321 * (lnAge * lnSBP) +
+        7.574 * smokerVal + -1.665 * (lnAge * smokerVal) +
+        0.661 * diabetesVal;
+      meanCoeff = -29.18;
+      baselineSurvival = 0.9665;
+    }
+
+    const rawRisk = (1 - Math.pow(baselineSurvival, Math.exp(sumCoeff - meanCoeff))) * 100;
+    if (!isFinite(rawRisk) || isNaN(rawRisk)) { setCalcError("Calculation error — please check input values."); return; }
+    const risk = Math.round(rawRisk * 10) / 10;
+    const clampedRisk = Math.max(0, Math.min(risk, 100));
+
+    let category: string;
+    let color: string;
+    if (clampedRisk < 5) { category = "Low"; color = "#10b981"; }
+    else if (clampedRisk < 7.5) { category = "Borderline"; color = "#f59e0b"; }
+    else if (clampedRisk < 20) { category = "Intermediate"; color = "#f97316"; }
+    else { category = "High"; color = "#ef4444"; }
+
+    setRiskResult({ risk: clampedRisk, category, color });
+    onToolResult(`[ASCVD Calculator] 10-Year Risk: ${clampedRisk}% (${category}). Age ${age}, ${sex}, TC ${totalChol}, HDL ${hdl}, SBP ${sbp}/${dbp}, ${bpTreatment ? "on BP meds" : "no BP meds"}, ${smoker ? "smoker" : "non-smoker"}, ${diabetes ? "diabetic" : "non-diabetic"}.`);
+  };
+
+  const discussWithAI = () => {
+    if (!riskResult) return;
+    const prompt = `Patient ASCVD 10-Year Risk: ${riskResult.risk}% (${riskResult.category} Risk)\n\nRisk factors: Age ${age}, ${sex}, TC ${totalChol}, HDL ${hdl}, SBP ${sbp}/${dbp}, ${bpTreatment ? "on BP meds" : "no BP meds"}, ${smoker ? "smoker" : "non-smoker"}, ${diabetes ? "diabetic" : "non-diabetic"}.\n\nPlease provide clinical recommendations for reducing cardiovascular risk.`;
+    setChatInput(prompt);
+    setChatOpen(true);
+  };
+
+  // SVG gauge parameters
+  const gaugeRadius = 90;
+  const gaugeStroke = 14;
+  const gaugeCirc = Math.PI * gaugeRadius; // half-circle
+  const gaugeDash = riskResult ? (riskResult.risk / 100) * gaugeCirc : 0;
+
+  const modifiableFactors = riskResult ? [
+    { name: "Total Cholesterol", current: `${totalChol} mg/dL`, target: "<200 mg/dL", rec: "Consider statin therapy (e.g., Atorvastatin 20mg)", icon: "bg-amber", color: "#f59e0b", show: totalChol >= 200 },
+    { name: "Blood Pressure", current: `${sbp}/${dbp} mmHg`, target: "<130/80 mmHg", rec: bpTreatment ? "Consider Lisinopril dose increase or add second agent" : "Initiate antihypertensive therapy", icon: "bg-red", color: "#ef4444", show: sbp >= 130 || dbp >= 80 },
+    { name: "Smoking Status", current: smoker ? "Active/Former smoker" : "Non-smoker", target: "Non-smoker", rec: "Smoking cessation counseling, consider NRT or Varenicline", icon: "bg-orange", color: "#f97316", show: smoker },
+    { name: "HDL Cholesterol", current: `${hdl} mg/dL`, target: ">60 mg/dL", rec: "Increase physical activity, dietary modifications", icon: "bg-blue", color: "#3b82f6", show: hdl < 60 },
+    { name: "Diabetes", current: diabetes ? "Yes" : "No", target: "HbA1c <7%", rec: "Tight glycemic control, lifestyle modifications", icon: "bg-purple", color: "#8b5cf6", show: diabetes },
+  ].filter(f => f.show) : [];
+
+  return (
+    <div style={{ display: "flex", gap: 24, padding: 24, height: "calc(100vh - 72px)", overflow: "hidden" }}>
+      {/* Left Panel — Risk Factor Inputs */}
+      <div style={{ width: 380, flexShrink: 0, overflow: "auto" }}>
+        <div className="tool-panel">
+          <div className="tool-panel-header">
+            <h3>Risk Factors</h3>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>ACC/AHA 2013</span>
+          </div>
+          <div className="tool-panel-body" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            {/* Age */}
+            <div>
+              <label className="tool-label">Age (40-79)</label>
+              <input className="tool-input" type="number" min={40} max={79} value={age} onChange={e => setAge(Number(e.target.value))} />
+            </div>
+
+            {/* Sex */}
+            <div>
+              <label className="tool-label">Sex</label>
+              <div className="sex-toggle">
+                <button className={sex === "male" ? "active" : ""} onClick={() => setSex("male")}>Male</button>
+                <button className={sex === "female" ? "active" : ""} onClick={() => setSex("female")}>Female</button>
+              </div>
+            </div>
+
+            {/* Cholesterol row */}
+            <div style={{ display: "flex", gap: 12 }}>
+              <div style={{ flex: 1 }}>
+                <label className="tool-label">Total Cholesterol</label>
+                <input className="tool-input" type="number" value={totalChol} onChange={e => setTotalChol(Number(e.target.value))} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <label className="tool-label">HDL</label>
+                <input className="tool-input" type="number" value={hdl} onChange={e => setHdl(Number(e.target.value))} />
+              </div>
+            </div>
+
+            {/* BP row */}
+            <div style={{ display: "flex", gap: 12 }}>
+              <div style={{ flex: 1 }}>
+                <label className="tool-label">Systolic BP</label>
+                <input className="tool-input" type="number" value={sbp} onChange={e => setSbp(Number(e.target.value))} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <label className="tool-label">Diastolic BP</label>
+                <input className="tool-input" type="number" value={dbp} onChange={e => setDbp(Number(e.target.value))} />
+              </div>
+            </div>
+
+            {/* Checkboxes */}
+            <div
+              className={`tool-checkbox ${bpTreatment ? "checked" : ""}`}
+              onClick={() => setBpTreatment(!bpTreatment)}
+            >
+              <div className="tool-checkbox-box">
+                {bpTreatment && <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3"><polyline points="20 6 9 17 4 12"/></svg>}
+              </div>
+              <span style={{ fontSize: 13, fontWeight: 500 }}>On Blood Pressure Treatment</span>
+            </div>
+
+            <div
+              className={`tool-checkbox ${smoker ? "checked" : ""}`}
+              onClick={() => setSmoker(!smoker)}
+            >
+              <div className="tool-checkbox-box">
+                {smoker && <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3"><polyline points="20 6 9 17 4 12"/></svg>}
+              </div>
+              <span style={{ fontSize: 13, fontWeight: 500 }}>Current or Former Smoker</span>
+            </div>
+
+            <div
+              className={`tool-checkbox ${diabetes ? "checked" : ""}`}
+              onClick={() => setDiabetes(!diabetes)}
+            >
+              <div className="tool-checkbox-box">
+                {diabetes && <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3"><polyline points="20 6 9 17 4 12"/></svg>}
+              </div>
+              <span style={{ fontSize: 13, fontWeight: 500 }}>Diabetes</span>
+            </div>
+
+            {/* Calculate */}
+            {calcError && (
+              <div style={{ padding: "8px 12px", background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, fontSize: 12, color: "#dc2626", fontWeight: 500 }}>{calcError}</div>
+            )}
+            <button className="tool-btn-primary" style={{ width: "100%", marginTop: 8 }} onClick={calculateRisk}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+              Calculate 10-Year Risk
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Right Panel — Results */}
+      <div style={{ flex: 1, overflow: "auto" }}>
+        {!riskResult ? (
+          <div className="tool-panel" style={{ minHeight: "100%" }}>
+            <div className="tool-panel-header"><h3>Risk Assessment</h3></div>
+            <div className="tool-panel-body">
+              <div className="tool-empty-state">
+                <svg fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+                <p>Enter risk factors and click <strong>Calculate 10-Year Risk</strong> to estimate ASCVD risk using the Pooled Cohort Equations.</p>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+            {/* Gauge Card */}
+            <div className="tool-panel">
+              <div className="tool-panel-body">
+                <div className="ascvd-gauge-container">
+                  <svg width="220" height="130" viewBox="0 0 220 130">
+                    {/* Background arc */}
+                    <path
+                      d={`M 20 120 A ${gaugeRadius} ${gaugeRadius} 0 0 1 200 120`}
+                      fill="none"
+                      stroke="#e5e7eb"
+                      strokeWidth={gaugeStroke}
+                      strokeLinecap="round"
+                    />
+                    {/* Colored arc */}
+                    <path
+                      d={`M 20 120 A ${gaugeRadius} ${gaugeRadius} 0 0 1 200 120`}
+                      fill="none"
+                      stroke={riskResult.color}
+                      strokeWidth={gaugeStroke}
+                      strokeLinecap="round"
+                      strokeDasharray={`${gaugeDash} ${gaugeCirc}`}
+                      style={{ transition: "stroke-dasharray 0.8s ease" }}
+                    />
+                  </svg>
+                  <div className="ascvd-gauge-value" style={{ color: riskResult.color }}>{riskResult.risk}%</div>
+                  <div className="ascvd-gauge-label" style={{ color: riskResult.color }}>{riskResult.category} Risk</div>
+                  <p style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 4 }}>10-Year ASCVD Risk (Pooled Cohort Equations)</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Modifiable Risk Factors */}
+            {modifiableFactors.length > 0 && (
+              <div className="tool-panel">
+                <div className="tool-panel-header">
+                  <h3>Modifiable Risk Factors</h3>
+                  <SeverityBadge level={riskResult.category === "High" ? "high" : riskResult.category === "Intermediate" ? "moderate" : "low"} />
+                </div>
+                <div className="tool-panel-body" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {modifiableFactors.map(factor => (
+                    <div key={factor.name} className="risk-factor-card">
+                      <div className="risk-factor-icon" style={{ background: `${factor.color}15` }}>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={factor.color} strokeWidth="2">
+                          <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+                        </svg>
+                      </div>
+                      <div className="risk-factor-content">
+                        <div className="risk-factor-name">{factor.name}</div>
+                        <div className="risk-factor-value">{factor.current} → Target: {factor.target}</div>
+                        <div className="risk-factor-rec">{factor.rec}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Discuss with AI */}
+            <button className="tool-btn-outline" style={{ alignSelf: "flex-start" }} onClick={discussWithAI}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+              Discuss with AI Assistant
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+/* ─── TOOL 4: Lab Trends Explorer ─── */
+const LAB_COLORS: Record<string, string> = {
+  K: "#ef4444", LDL: "#f59e0b", HDL: "#3b82f6",
+  CRP: "#8b5cf6", Creatinine: "#14b8a6", Copper: "#f97316",
+};
+
+const LabTrendsExplorer = () => {
+  const [selectedLabs, setSelectedLabs] = useState<Record<string, boolean>>({
+    K: true, LDL: false, HDL: false, CRP: false, Creatinine: false, Copper: false,
+  });
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+
+  const PAD = { top: 20, right: 30, bottom: 50, left: 60 };
+  const W = 700, H = 360;
+  const chartW = W - PAD.left - PAD.right;
+  const chartH = H - PAD.top - PAD.bottom;
+
+  const dates = LAB_TRENDS.map(p => new Date(p.date).getTime());
+  const minDate = Math.min(...dates);
+  const maxDate = Math.max(...dates);
+  const xScale = (d: string) => PAD.left + ((new Date(d).getTime() - minDate) / (maxDate - minDate)) * chartW;
+
+  const yScaleForLab = (key: string) => {
+    const vals = LAB_TRENDS.map(p => p[key as keyof LabTrendPoint] as number | null).filter((v): v is number => v !== null);
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    if (vals.length === 0) return { scale: (_v: number) => 0, min: 0, max: 0 };
+    const range = REFERENCE_RANGES[key];
+    const allVals = [...vals, range.min, range.max];
+    const vMin = Math.min(...allVals) * 0.85;
+    const vMax = Math.max(...allVals) * 1.15;
+    return {
+      scale: (v: number) => PAD.top + chartH - ((v - vMin) / (vMax - vMin)) * chartH,
+      min: vMin, max: vMax,
+    };
+  };
+
+  const getTrend = (key: string): { label: string; cls: string } => {
+    const vals = LAB_TRENDS.map(p => p[key as keyof LabTrendPoint]).filter((v): v is number => v !== null);
+    if (vals.length < 2) return { label: "N/A", cls: "stable" };
+    const last = vals[vals.length - 1];
+    const prev = vals[vals.length - 2];
+    const range = REFERENCE_RANGES[key];
+    const outOfRange = last < range.min || last > range.max;
+    if (last > prev * 1.03) return { label: outOfRange ? "Trending Up" : "Rising", cls: "up" };
+    if (last < prev * 0.97) return { label: "Improving", cls: "down" };
+    return { label: "Stable", cls: "stable" };
+  };
+
+  const activeKeys = Object.entries(selectedLabs).filter(([, v]) => v).map(([k]) => k);
+
+  return (
+    <div style={{ display: "flex", gap: 24, padding: 24, height: "calc(100vh - 72px)", overflow: "hidden" }}>
+      {/* Left Panel — Lab Selection */}
+      <div style={{ width: 260, flexShrink: 0, overflow: "auto" }}>
+        <div className="tool-panel">
+          <div className="tool-panel-header"><h3>Lab Values</h3></div>
+          <div className="tool-panel-body" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {Object.keys(REFERENCE_RANGES).map(key => (
+              <div
+                key={key}
+                className={`tool-checkbox ${selectedLabs[key] ? "checked" : ""}`}
+                onClick={() => setSelectedLabs(prev => ({ ...prev, [key]: !prev[key] }))}
+                style={{ borderLeft: `3px solid ${LAB_COLORS[key]}` }}
+              >
+                <div className="tool-checkbox-box">
+                  {selectedLabs[key] && (
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3"><polyline points="20 6 9 17 4 12"/></svg>
+                  )}
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>{REFERENCE_RANGES[key].label}</div>
+                  <div style={{ fontSize: 11, color: "var(--text-muted)" }}>Range: {REFERENCE_RANGES[key].min}–{REFERENCE_RANGES[key].max} {REFERENCE_RANGES[key].unit}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Right Panel — Chart + Summary */}
+      <div style={{ flex: 1, overflow: "auto", display: "flex", flexDirection: "column", gap: 16 }}>
+        <div className="tool-panel">
+          <div className="tool-panel-header">
+            <h3>Lab Trends</h3>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Feb 2024 – Jan 2026</span>
+          </div>
+          <div className="tool-panel-body" style={{ position: "relative" }}>
+            {activeKeys.length === 0 ? (
+              <div className="tool-empty-state">
+                <svg fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24" style={{ width: 48, height: 48 }}><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                <p>Select lab values from the left panel to visualize trends over time.</p>
+              </div>
+            ) : (
+              <>
+                <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: "block" }}>
+                  {/* Grid lines */}
+                  {[0, 0.25, 0.5, 0.75, 1].map(pct => {
+                    const y = PAD.top + pct * chartH;
+                    return <line key={pct} x1={PAD.left} x2={PAD.left + chartW} y1={y} y2={y} stroke="#e5e7eb" strokeWidth={1} strokeDasharray="4,4" />;
+                  })}
+
+                  {/* Reference range bands */}
+                  {activeKeys.map(key => {
+                    const range = REFERENCE_RANGES[key];
+                    const { scale } = yScaleForLab(key);
+                    const y1 = scale(range.max);
+                    const y2 = scale(range.min);
+                    return <rect key={`ref-${key}`} x={PAD.left} y={Math.min(y1, y2)} width={chartW} height={Math.abs(y2 - y1)} fill={LAB_COLORS[key]} opacity={0.06} rx={4} />;
+                  })}
+
+                  {/* X-axis labels */}
+                  {LAB_TRENDS.map((p, i) => (
+                    <text key={i} x={xScale(p.date)} y={PAD.top + chartH + 30} textAnchor="middle" fontSize={9} fill="#94a3b8">{p.label}</text>
+                  ))}
+
+                  {/* X-axis ticks */}
+                  {LAB_TRENDS.map((p, i) => (
+                    <line key={`tick-${i}`} x1={xScale(p.date)} x2={xScale(p.date)} y1={PAD.top + chartH} y2={PAD.top + chartH + 6} stroke="#d1d5db" strokeWidth={1} />
+                  ))}
+
+                  {/* Data lines + dots */}
+                  {activeKeys.map(key => {
+                    const { scale } = yScaleForLab(key);
+                    const validPoints = LAB_TRENDS
+                      .filter(p => p[key as keyof LabTrendPoint] !== null)
+                      .map(p => ({ x: xScale(p.date), y: scale(p[key as keyof LabTrendPoint] as number), val: p[key as keyof LabTrendPoint] as number }));
+                    const points = validPoints.map(p => `${p.x},${p.y}`).join(" ");
+                    const range = REFERENCE_RANGES[key];
+                    return (
+                      <g key={`line-${key}`}>
+                        <polyline fill="none" stroke={LAB_COLORS[key]} strokeWidth={2.5} strokeLinejoin="round" strokeLinecap="round" points={points} style={{ filter: `drop-shadow(0 1px 3px ${LAB_COLORS[key]}40)` }} />
+                        {validPoints.map((p, j) => {
+                          const inRange = p.val >= range.min && p.val <= range.max;
+                          return (
+                            <circle key={j} cx={p.x} cy={p.y} r={4}
+                              fill={inRange ? LAB_COLORS[key] : "#fff"}
+                              stroke={inRange ? LAB_COLORS[key] : "#ef4444"}
+                              strokeWidth={inRange ? 0 : 2.5} />
+                          );
+                        })}
+                      </g>
+                    );
+                  })}
+
+                  {/* Hover crosshair */}
+                  {hoveredIndex !== null && (
+                    <line x1={xScale(LAB_TRENDS[hoveredIndex].date)} x2={xScale(LAB_TRENDS[hoveredIndex].date)} y1={PAD.top} y2={PAD.top + chartH} stroke="#94a3b8" strokeWidth={1} strokeDasharray="3,3" />
+                  )}
+
+                  {/* Invisible hover rects */}
+                  {LAB_TRENDS.map((p, i) => (
+                    <rect key={`hover-${i}`} x={xScale(p.date) - 25} y={PAD.top} width={50} height={chartH} fill="transparent" style={{ cursor: "crosshair" }}
+                      onMouseEnter={() => setHoveredIndex(i)}
+                      onMouseLeave={() => setHoveredIndex(null)} />
+                  ))}
+                </svg>
+
+                {/* Tooltip */}
+                {hoveredIndex !== null && (
+                  <div className="chart-tooltip" style={{ left: Math.min(xScale(LAB_TRENDS[hoveredIndex].date) + 12, W - 200), top: PAD.top + 10 }}>
+                    <div className="chart-tooltip-date">{LAB_TRENDS[hoveredIndex].label}</div>
+                    {activeKeys.map(key => {
+                      const val = LAB_TRENDS[hoveredIndex][key as keyof LabTrendPoint];
+                      if (val === null) return <div key={key} className="chart-tooltip-row"><span className="chart-tooltip-label" style={{ color: LAB_COLORS[key] }}>{REFERENCE_RANGES[key].label}</span><span className="chart-tooltip-value" style={{ color: "#94a3b8" }}>—</span></div>;
+                      const range = REFERENCE_RANGES[key];
+                      const inRange = (val as number) >= range.min && (val as number) <= range.max;
+                      return (
+                        <div key={key} className="chart-tooltip-row">
+                          <span className="chart-tooltip-label" style={{ color: LAB_COLORS[key] }}>{REFERENCE_RANGES[key].label}</span>
+                          <span className="chart-tooltip-value" style={{ color: inRange ? "var(--text-primary)" : "#ef4444", fontWeight: inRange ? 700 : 800 }}>{val} {range.unit}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Summary Cards */}
+        {activeKeys.length > 0 && (
+          <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(activeKeys.length, 3)}, 1fr)`, gap: 12 }}>
+            {activeKeys.map(key => {
+              const vals = LAB_TRENDS.map(p => p[key as keyof LabTrendPoint]).filter((v): v is number => v !== null);
+              const latest = vals.length > 0 ? vals[vals.length - 1] : null;
+              const range = REFERENCE_RANGES[key];
+              const inRange = latest !== null && latest >= range.min && latest <= range.max;
+              const trend = getTrend(key);
+              return (
+                <div key={key} className="tool-panel" style={{ padding: 16 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                    <div style={{ width: 10, height: 10, borderRadius: "50%", background: LAB_COLORS[key] }} />
+                    <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-primary)" }}>{range.label}</span>
+                  </div>
+                  <div style={{ fontSize: 28, fontWeight: 800, color: inRange ? "#10b981" : "#ef4444", marginBottom: 4 }}>
+                    {latest ?? "—"} <span style={{ fontSize: 12, fontWeight: 500, color: "var(--text-muted)" }}>{range.unit}</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span className={`trend-badge ${trend.cls}`}>{trend.cls === "up" ? "↗" : trend.cls === "down" ? "↘" : "→"} {trend.label}</span>
+                    <span style={{ fontSize: 10, color: "var(--text-muted)" }}>Ref: {range.min}–{range.max}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+/* ─── TOOL 5: Vital Signs Timeline ─── */
+const VitalSignsTimeline = () => {
+  const [animateLines, setAnimateLines] = useState(false);
+  const systolicRef = useRef<SVGPathElement>(null);
+  const diastolicRef = useRef<SVGPathElement>(null);
+  const [pathLengths, setPathLengths] = useState({ sys: 1000, dia: 1000 });
+
+  useEffect(() => {
+    if (systolicRef.current) setPathLengths(prev => ({ ...prev, sys: systolicRef.current!.getTotalLength() }));
+    if (diastolicRef.current) setPathLengths(prev => ({ ...prev, dia: diastolicRef.current!.getTotalLength() }));
+    const t = setTimeout(() => setAnimateLines(true), 100);
+    return () => clearTimeout(t);
+  }, []);
+
+  const PAD = { top: 30, right: 30, bottom: 50, left: 55 };
+  const W = 700, H = 280;
+  const chartW = W - PAD.left - PAD.right;
+  const chartH = H - PAD.top - PAD.bottom;
+
+  const bpDates = BP_READINGS.map(p => new Date(p.date).getTime());
+  const minDate = Math.min(...bpDates);
+  const maxDate = Math.max(...bpDates);
+  const xScale = (d: string) => PAD.left + ((new Date(d).getTime() - minDate) / (maxDate - minDate)) * chartW;
+
+  const yMin = 60, yMax = 170;
+  const yScale = (v: number) => PAD.top + chartH - ((v - yMin) / (yMax - yMin)) * chartH;
+
+  const toBezier = (pts: { x: number; y: number }[]): string => {
+    if (pts.length < 2) return "";
+    let d = `M ${pts[0].x} ${pts[0].y}`;
+    for (let i = 1; i < pts.length; i++) {
+      const cpx = (pts[i - 1].x + pts[i].x) / 2;
+      d += ` C ${cpx} ${pts[i - 1].y}, ${cpx} ${pts[i].y}, ${pts[i].x} ${pts[i].y}`;
+    }
+    return d;
+  };
+
+  const sysPts = BP_READINGS.map(r => ({ x: xScale(r.date), y: yScale(r.systolic) }));
+  const diaPts = BP_READINGS.map(r => ({ x: xScale(r.date), y: yScale(r.diastolic) }));
+  const sysPath = toBezier(sysPts);
+  const diaPath = toBezier(diaPts);
+
+  const MED_COLORS: Record<string, string> = {
+    "Lisinopril 10mg": "#3b82f6", "Aspirin 325mg": "#10b981", "Colchicine 0.5mg": "#f59e0b",
+    "Tylenol 500mg": "#94a3b8", "Doxycycline 100mg": "#8b5cf6",
+  };
+
+  const miniVitals = [
+    { key: "hr" as const, label: "Heart Rate", unit: "bpm", color: "#ef4444", latest: 78 },
+    { key: "weight" as const, label: "Weight", unit: "lbs", color: "#10b981", latest: 195 },
+    { key: "temp" as const, label: "Temperature", unit: "\u00B0F", color: "#f59e0b", latest: 98.6 },
+    { key: "spo2" as const, label: "SpO2", unit: "%", color: "#8b5cf6", latest: 97 },
+  ];
+
+  const vitalSparkline = (key: "hr" | "weight" | "temp" | "spo2") => {
+    const vals = VITAL_TRENDS.map(v => v[key]).filter((v): v is number => v !== null);
+    if (vals.length < 2) return "";
+    const min = Math.min(...vals) * 0.98;
+    const max = Math.max(...vals) * 1.02;
+    const range = max - min || 1;
+    const stepX = 120 / (vals.length - 1);
+    return vals.map((v, i) => `${i * stepX},${50 - ((v - min) / range) * 44}`).join(" ");
+  };
+
+  // Gantt chart
+  const ganttMinDate = new Date("2024-02-01").getTime();
+  const ganttMaxDate = new Date("2026-03-01").getTime();
+  const ganttW = chartW;
+  const ganttXScale = (d: string) => PAD.left + ((new Date(d).getTime() - ganttMinDate) / (ganttMaxDate - ganttMinDate)) * ganttW;
+
+  return (
+    <div style={{ padding: 24, height: "calc(100vh - 72px)", overflow: "auto" }}>
+      {/* BP Chart */}
+      <div className="tool-panel" style={{ marginBottom: 16 }}>
+        <div className="tool-panel-header">
+          <h3>Blood Pressure Trend</h3>
+          <div style={{ display: "flex", gap: 16, fontSize: 11, fontWeight: 600 }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "#ef4444", borderRadius: 1 }} /> Systolic</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 16, height: 2, background: "#3b82f6", borderRadius: 1 }} /> Diastolic</span>
+          </div>
+        </div>
+        <div className="tool-panel-body">
+          <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: "block" }}>
+            {/* Target zone bands */}
+            <rect x={PAD.left} y={yScale(170)} width={chartW} height={yScale(140) - yScale(170)} fill="#ef4444" opacity={0.04} />
+            <rect x={PAD.left} y={yScale(140)} width={chartW} height={yScale(130) - yScale(140)} fill="#f59e0b" opacity={0.06} />
+            <rect x={PAD.left} y={yScale(130)} width={chartW} height={yScale(60) - yScale(130)} fill="#10b981" opacity={0.04} />
+            {/* Target line at 130 */}
+            <line x1={PAD.left} x2={PAD.left + chartW} y1={yScale(130)} y2={yScale(130)} stroke="#10b981" strokeWidth={1} strokeDasharray="6,4" opacity={0.5} />
+            <text x={PAD.left + chartW + 4} y={yScale(130) + 3} fontSize={9} fill="#10b981" fontWeight={600}>130</text>
+            {/* Target line at 80 */}
+            <line x1={PAD.left} x2={PAD.left + chartW} y1={yScale(80)} y2={yScale(80)} stroke="#3b82f6" strokeWidth={1} strokeDasharray="6,4" opacity={0.3} />
+            <text x={PAD.left + chartW + 4} y={yScale(80) + 3} fontSize={9} fill="#3b82f6" fontWeight={600}>80</text>
+
+            {/* Grid */}
+            {[80, 100, 120, 140, 160].map(v => (
+              <g key={v}>
+                <line x1={PAD.left} x2={PAD.left + chartW} y1={yScale(v)} y2={yScale(v)} stroke="#e5e7eb" strokeWidth={1} strokeDasharray="4,4" />
+                <text x={PAD.left - 8} y={yScale(v) + 3} textAnchor="end" fontSize={9} fill="#94a3b8">{v}</text>
+              </g>
+            ))}
+
+            {/* X-axis labels */}
+            {BP_READINGS.map((r, i) => (
+              <text key={i} x={xScale(r.date)} y={PAD.top + chartH + 30} textAnchor="middle" fontSize={9} fill="#94a3b8">{r.label}</text>
+            ))}
+
+            {/* Medication overlay markers */}
+            {MEDICATION_TIMELINE.map(med => {
+              const bpX = PAD.left + ((new Date(med.startDate).getTime() - minDate) / (maxDate - minDate)) * chartW;
+              if (bpX < PAD.left || bpX > PAD.left + chartW) return null;
+              return (
+                <g key={med.drug + med.startDate}>
+                  <line x1={bpX} x2={bpX} y1={PAD.top} y2={PAD.top + chartH} stroke="#8b5cf6" strokeWidth={1} strokeDasharray="2,4" opacity={0.3} />
+                  <rect x={bpX - 36} y={PAD.top - 16} width={72} height={14} rx={7} fill="#f5f3ff" stroke="#ddd6fe" strokeWidth={0.5} />
+                  <text x={bpX} y={PAD.top - 7} textAnchor="middle" fontSize={7} fill="#7c3aed" fontWeight={600}>{med.drug.split(" ")[0]}</text>
+                </g>
+              );
+            })}
+
+            {/* Systolic curve */}
+            <path ref={systolicRef} d={sysPath} fill="none" stroke="#ef4444" strokeWidth={2.5} strokeLinecap="round"
+              strokeDasharray={pathLengths.sys} strokeDashoffset={animateLines ? 0 : pathLengths.sys}
+              style={{ transition: "stroke-dashoffset 1.5s cubic-bezier(0.16, 1, 0.3, 1)", filter: "drop-shadow(0 1px 3px rgba(239,68,68,0.3))" }} />
+            {/* Diastolic curve */}
+            <path ref={diastolicRef} d={diaPath} fill="none" stroke="#3b82f6" strokeWidth={2.5} strokeLinecap="round"
+              strokeDasharray={pathLengths.dia} strokeDashoffset={animateLines ? 0 : pathLengths.dia}
+              style={{ transition: "stroke-dashoffset 1.5s cubic-bezier(0.16, 1, 0.3, 1)", filter: "drop-shadow(0 1px 3px rgba(59,130,246,0.3))" }} />
+
+            {/* Data dots */}
+            {BP_READINGS.map((r, i) => (
+              <g key={`dots-${i}`}>
+                <circle cx={xScale(r.date)} cy={yScale(r.systolic)} r={3.5} fill="#ef4444" stroke="#fff" strokeWidth={1.5} />
+                <circle cx={xScale(r.date)} cy={yScale(r.diastolic)} r={3.5} fill="#3b82f6" stroke="#fff" strokeWidth={1.5} />
+              </g>
+            ))}
+          </svg>
+        </div>
+      </div>
+
+      {/* Mini Vital Cards */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 16 }}>
+        {miniVitals.map(v => (
+          <div key={v.key} className="tool-panel" style={{ padding: 16 }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>{v.label}</div>
+            <div style={{ fontSize: 26, fontWeight: 800, color: v.color, marginBottom: 2 }}>{v.latest} <span style={{ fontSize: 12, fontWeight: 500, color: "var(--text-muted)" }}>{v.unit}</span></div>
+            <svg width="100%" viewBox="0 0 120 50" style={{ display: "block", opacity: 0.6 }}>
+              <polyline fill="none" stroke={v.color} strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" points={vitalSparkline(v.key)} />
+            </svg>
+          </div>
+        ))}
+      </div>
+
+      {/* Medication Gantt */}
+      <div className="tool-panel">
+        <div className="tool-panel-header"><h3>Medication Timeline</h3></div>
+        <div className="tool-panel-body">
+          <svg width="100%" viewBox={`0 0 ${W} 190`} style={{ display: "block" }}>
+            {/* Year markers */}
+            {["2024-01-01", "2025-01-01", "2026-01-01"].map(d => {
+              const x = ganttXScale(d);
+              return (
+                <g key={d}>
+                  <line x1={x} x2={x} y1={10} y2={180} stroke="#e5e7eb" strokeWidth={1} strokeDasharray="4,4" />
+                  <text x={x} y={8} textAnchor="middle" fontSize={10} fill="#94a3b8" fontWeight={600}>{d.slice(0, 4)}</text>
+                </g>
+              );
+            })}
+
+            {MEDICATION_TIMELINE.map((med, i) => {
+              const x1 = ganttXScale(med.startDate);
+              const x2 = med.endDate ? ganttXScale(med.endDate) : ganttXScale("2026-02-23");
+              const y = 28 + i * 32;
+              const color = MED_COLORS[med.drug] || "#64748b";
+              return (
+                <g key={med.drug} className="gantt-bar">
+                  <text x={PAD.left - 8} y={y + 14} textAnchor="end" fontSize={10} fill="#475569" fontWeight={500}>{med.drug}</text>
+                  <rect x={x1} y={y} width={Math.max(x2 - x1, 6)} height={22} rx={6} fill={color} opacity={0.15} stroke={color} strokeWidth={1.5} />
+                  <circle cx={x1} cy={y + 11} r={4} fill={color} />
+                  {med.endDate && <circle cx={x2} cy={y + 11} r={4} fill="#fff" stroke={color} strokeWidth={2} />}
+                  {!med.endDate && (
+                    <text x={x2 - 4} y={y + 14} textAnchor="end" fontSize={8} fill={color} fontWeight={700}>ongoing</text>
+                  )}
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* ─── TOOL 6: Patient Health Radar ─── */
+const getScoreColor = (score: number): string => {
+  if (score >= 80) return "#10b981";
+  if (score >= 60) return "#f59e0b";
+  if (score >= 40) return "#f97316";
+  return "#ef4444";
+};
+
+const getScoreClass = (score: number): string => {
+  if (score >= 80) return "green";
+  if (score >= 60) return "yellow";
+  if (score >= 40) return "orange";
+  return "red";
+};
+
+const PatientHealthRadar = ({ onToolResult }: { onToolResult: (entry: string) => void }) => {
+  const [calculated, setCalculated] = useState(false);
+  const [scores, setScores] = useState<ReturnType<typeof computeBodySystemScores>>([]);
+  const [animateRadar, setAnimateRadar] = useState(false);
+
+  const calculate = () => {
+    const computed = computeBodySystemScores();
+    setScores(computed);
+    setCalculated(true);
+    setTimeout(() => setAnimateRadar(true), 50);
+    const avg = Math.round(computed.reduce((s, sc) => s + sc.score, 0) / computed.length);
+    const weakest = computed.sort((a, b) => a.score - b.score).slice(0, 3).map(s => `${s.system}: ${s.score}/100`).join(", ");
+    onToolResult(`[Health Radar] Overall Score: ${avg}/100. Weakest systems: ${weakest}. Key concerns: ${computed.filter(s => s.score < 60).map(s => s.rationale).join(" ")}`);
+  };
+
+  const cx = 200, cy = 200, maxR = 150;
+  const axes = scores.map((_, i) => {
+    const angle = (Math.PI * 2 * i) / scores.length - Math.PI / 2;
+    return { angle, x: cx + maxR * Math.cos(angle), y: cy + maxR * Math.sin(angle) };
+  });
+
+  const avg = scores.length > 0 ? Math.round(scores.reduce((s, sc) => s + sc.score, 0) / scores.length) : 0;
+
+  const centerPoints = scores.map(() => `${cx},${cy}`).join(" ");
+  const dataPoints = scores.map((s, i) => {
+    const r = (s.score / 100) * maxR;
+    return `${cx + r * Math.cos(axes[i].angle)},${cy + r * Math.sin(axes[i].angle)}`;
+  }).join(" ");
+
+  return (
+    <div style={{ padding: 24, height: "calc(100vh - 72px)", overflow: "auto" }}>
+      {!calculated ? (
+        <div style={{ display: "flex", justifyContent: "center", paddingTop: 80 }}>
+          <div className="tool-panel" style={{ padding: 48, textAlign: "center", maxWidth: 480 }}>
+            <div className="tool-empty-state">
+              <svg fill="none" stroke="currentColor" strokeWidth="1.5" viewBox="0 0 24 24" style={{ width: 48, height: 48 }}><polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/></svg>
+              <p>Compute a holistic health assessment across 8 body systems based on the patient&apos;s labs, vitals, and clinical history.</p>
+            </div>
+            <button className="tool-btn-primary" onClick={calculate} style={{ marginTop: 20 }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/></svg>
+              Calculate Health Score
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div style={{ display: "flex", gap: 24 }}>
+          {/* Radar Chart */}
+          <div style={{ width: 440, flexShrink: 0 }}>
+            <div className="tool-panel">
+              <div className="tool-panel-header">
+                <h3>Health Radar</h3>
+                <span style={{ fontSize: 11, color: "var(--text-muted)" }}>8 Body Systems</span>
+              </div>
+              <div className="tool-panel-body" style={{ display: "flex", justifyContent: "center" }}>
+                <svg width="100%" viewBox="0 0 400 400" style={{ maxWidth: 400 }}>
+                  {/* Concentric guide polygons */}
+                  {[0.25, 0.5, 0.75, 1].map(pct => (
+                    <polygon key={pct}
+                      points={axes.map(a => `${cx + maxR * pct * Math.cos(a.angle)},${cy + maxR * pct * Math.sin(a.angle)}`).join(" ")}
+                      fill="none" stroke="#e5e7eb" strokeWidth={pct === 1 ? 1.5 : 0.5} />
+                  ))}
+
+                  {/* Axis lines */}
+                  {axes.map((a, i) => (
+                    <line key={i} x1={cx} y1={cy} x2={a.x} y2={a.y} stroke="#d1d5db" strokeWidth={0.5} />
+                  ))}
+
+                  {/* Percentage labels */}
+                  {[25, 50, 75, 100].map((pct, i) => (
+                    <text key={i} x={cx + 4} y={cy - maxR * (pct / 100) + 3} fontSize={8} fill="#cbd5e1">{pct}</text>
+                  ))}
+
+                  {/* Data polygon */}
+                  <polygon
+                    className="radar-polygon"
+                    points={animateRadar ? dataPoints : centerPoints}
+                    fill="rgba(59, 130, 246, 0.1)"
+                    stroke="rgba(59, 130, 246, 0.6)"
+                    strokeWidth={2}
+                  />
+
+                  {/* Score dots */}
+                  {scores.map((s, i) => {
+                    const r = animateRadar ? (s.score / 100) * maxR : 0;
+                    const dotX = cx + r * Math.cos(axes[i].angle);
+                    const dotY = cy + r * Math.sin(axes[i].angle);
+                    return (
+                      <circle key={i} cx={animateRadar ? dotX : cx} cy={animateRadar ? dotY : cy} r={5}
+                        fill={getScoreColor(s.score)} stroke="#fff" strokeWidth={2}
+                        style={{ transition: "all 0.8s cubic-bezier(0.16, 1, 0.3, 1)" }} />
+                    );
+                  })}
+
+                  {/* Axis labels */}
+                  {scores.map((s, i) => {
+                    const labelR = maxR + 28;
+                    return (
+                      <text key={i}
+                        x={cx + labelR * Math.cos(axes[i].angle)}
+                        y={cy + labelR * Math.sin(axes[i].angle)}
+                        textAnchor="middle" dominantBaseline="middle"
+                        fontSize={10} fontWeight={700}
+                        fill={getScoreColor(s.score)}>{s.system}</text>
+                    );
+                  })}
+                </svg>
+              </div>
+              {/* Overall score */}
+              <div style={{ textAlign: "center", paddingBottom: 20 }}>
+                <div style={{ fontSize: 42, fontWeight: 800, color: getScoreColor(avg) }}>{avg}</div>
+                <div style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 600 }}>Overall Health Score / 100</div>
+              </div>
+            </div>
+          </div>
+
+          {/* System Cards */}
+          <div style={{ flex: 1, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, alignContent: "start" }}>
+            {scores.map(s => (
+              <div key={s.system} className="tool-panel system-card" style={{ padding: 14, borderLeft: `3px solid ${getScoreColor(s.score)}` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text-primary)" }}>{s.system}</span>
+                  <span className={`score-circle ${getScoreClass(s.score)}`}>{s.score}</span>
+                </div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 6 }}>
+                  {s.keyMetrics.map(m => (
+                    <span key={m.label} style={{
+                      fontSize: 10, fontWeight: 600, padding: "2px 8px", borderRadius: 999,
+                      background: m.status === "critical" ? "#fef2f2" : m.status === "warning" ? "#fffbeb" : "#ecfdf5",
+                      color: m.status === "critical" ? "#dc2626" : m.status === "warning" ? "#d97706" : "#059669",
+                      border: `1px solid ${m.status === "critical" ? "#fecaca" : m.status === "warning" ? "#fde68a" : "#a7f3d0"}`,
+                    }}>{m.label}: {m.value}</span>
+                  ))}
+                </div>
+                <p style={{ fontSize: 11, color: "#64748b", lineHeight: 1.5, margin: 0 }}>{s.rationale}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 /* ─── Patient Portal Component ─── */
 export default function PatientPortal() {
   const [activeTab, setActiveTab] = useState("Overview");
   const [chatHovered, setChatHovered] = useState(false);
   const [activeNav, setActiveNav] = useState("Dashboard");
+  const [currentProvider, setCurrentProvider] = useState(STAFF.doctors[0]);
+  const [selectedPatientId, setSelectedPatientId] = useState("gord-sims");
+  const [patientSearch, setPatientSearch] = useState("");
+  const [alertsExpanded, setAlertsExpanded] = useState(true);
 
   /* Appointments state */
   const [appointments, setAppointments] = useState<Appointment[]>(INITIAL_APPOINTMENTS);
 
   const handleBookAppointment = (date: string, time: string, type: string) => {
-    const newApt: Appointment = { id: `apt-${Date.now()}`, date, time, patientName: "Gord Sims", patientId: "gord-sims", type, provider: "Dr. Patel" };
+    const pt = DEMO_PATIENTS.find(p => p.id === selectedPatientId);
+    const newApt: Appointment = { id: `apt-${Date.now()}`, date, time, patientName: pt?.name ?? "Patient", patientId: selectedPatientId, type, provider: currentProvider.name };
     setAppointments(prev => [...prev, newApt]);
   };
 
   const handleCancelAppointment = (id: string) => {
-    setAppointments(prev => prev.filter(a => !(a.id === id && a.patientId === "gord-sims")));
+    setAppointments(prev => prev.filter(a => !(a.id === id && a.patientId === selectedPatientId)));
   };
 
   /* Chat state */
   const [chatOpen, setChatOpen] = useState(false);
+  const [chatExpanded, setChatExpanded] = useState(false);
   const [chatMessages, setChatMessages] = useState<Array<{ role: string; content?: string; data?: any; time: string }>>([
-    { role: "system", content: "Hello! I have Gord Sims' full records loaded — 15 visit notes spanning 2 years, plus labs, meds, and imaging. What would you like to know?", time: "Now" },
+    { role: "system", content: "Hello! I'm MedAssist AI with full access to Gord Sims' medical records — 15 visit notes, labs, medications, imaging, and more. Ask me anything about this patient.", time: "Now" },
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
+  /* Tool context — tracks recent tool activity so AI can synthesize across tools */
+  const [toolContext, setToolContext] = useState<string[]>([]);
+  const addToolContext = (entry: string) => {
+    setToolContext(prev => {
+      const updated = [...prev, entry];
+      return updated.slice(-6); // keep last 6 tool events
+    });
+  };
+
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatMessages, chatLoading]);
+
+  /* Dynamic patient data (FHIR or demo fallback) */
+  const [patientInfo, setPatientInfo] = useState(DEMO_PATIENT_INFO);
+  const [visitNotes, setVisitNotes] = useState(DEMO_VISIT_NOTES);
+  const [, setDataSource] = useState<"demo" | "fhir">("demo");
+  const patientId = selectedPatientId;
+
+  useEffect(() => {
+    if (selectedPatientId === "gord-sims") {
+      fetch(`/api/patient/${selectedPatientId}`)
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.patientInfo) setPatientInfo(data.patientInfo);
+          if (data.visitNotes) setVisitNotes(data.visitNotes);
+          if (data.source) setDataSource(data.source);
+        })
+        .catch(() => { /* silently keep demo data */ });
+    } else {
+      const pt = DEMO_PATIENTS.find(p => p.id === selectedPatientId);
+      if (pt) {
+        setPatientInfo({
+          ...DEMO_PATIENT_INFO,
+          personal: { ...DEMO_PATIENT_INFO.personal, "Full Legal Name": pt.name, "Date of Birth": pt.dob, "Age": `${pt.age} years old`, "Sex": pt.sex === "M" ? "Male" : "Female" },
+        });
+        setVisitNotes([]);
+      }
+    }
+  }, [selectedPatientId]);
+
+  useEffect(() => {
+    const pt = DEMO_PATIENTS.find(p => p.id === selectedPatientId);
+    setChatMessages([{
+      role: "system",
+      content: `Hello! I'm MedAssist AI with full access to ${pt?.name ?? "the patient"}'s medical records — visit notes, labs, medications, imaging, and more. Ask me anything.`,
+      time: "Now",
+    }]);
+  }, [selectedPatientId]);
+
+  const clinicalAlerts = useMemo(() => {
+    if (selectedPatientId !== "gord-sims") return [];
+    return [
+      { id: "k-high", severity: "critical" as const, title: "Potassium Elevated: 5.8 mEq/L", detail: "Above normal range (3.5-5.0). Hyperkalemia risk with concurrent ACE inhibitor (Lisinopril).", color: "#ef4444" },
+      { id: "bp-high", severity: "warning" as const, title: "BP 132/83 — Stage 1 Hypertension", detail: "Above target <130/80. On Lisinopril 10mg. Consider dose increase or ARB switch.", color: "#f59e0b" },
+      { id: "drug-interaction", severity: "warning" as const, title: "Interaction: Lisinopril + Elevated K+", detail: "ACE inhibitors increase potassium retention. K+ trending up. Urgent reassessment needed.", color: "#f59e0b" },
+      { id: "cu-low", severity: "info" as const, title: "Copper Low: 62 ug/dL (range 70-140)", detail: "Mild copper deficiency. Monitor and consider supplementation.", color: "#3b82f6" },
+    ];
+  }, [selectedPatientId]);
 
   /* Availability helper */
   const getAvailabilityResponse = () => {
@@ -1568,11 +2426,44 @@ export default function PatientPortal() {
     setChatMessages((m) => [...m, { role: "user" as const, content: label, time: "Now" }]);
     setChatLoading(true);
     if (queryType === "notes_overview") {
-      const resp = buildNotesResponse(label);
-      setTimeout(() => {
-        setChatLoading(false);
-        setChatMessages((m) => [...m, { role: "assistant" as const, data: resp, time: "Now" } as any]);
-      }, 1500);
+      // Send to AI for a comprehensive visit history review
+      setChatLoading(true);
+      (async () => {
+        try {
+          const res = await fetch("/api/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ messages: [{ role: "user", content: "Give me a comprehensive overview of this patient's visit history, key milestones, and current concerns." }], patientId }),
+          });
+          if (!res.ok) throw new Error("API error");
+          setChatLoading(false);
+          setChatMessages((m) => [...m, { role: "assistant" as const, content: "", time: "Now" }]);
+          const reader = res.body?.getReader();
+          const decoder = new TextDecoder();
+          let fullText = "";
+          if (reader) {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              const chunk = decoder.decode(value, { stream: true });
+              fullText += chunk;
+              const captured = fullText;
+              setChatMessages((prev) => {
+                const updated = [...prev];
+                const last = updated[updated.length - 1];
+                if (last && last.role === "assistant" && !last.data) {
+                  updated[updated.length - 1] = { ...last, content: captured };
+                }
+                return updated;
+              });
+            }
+            if (!chatExpanded) setChatExpanded(true);
+          }
+        } catch {
+          setChatLoading(false);
+          setChatMessages((m) => [...m, { role: "assistant" as const, content: "Unable to retrieve visit history. Please try again.", time: "Now" }]);
+        }
+      })();
       return;
     }
     if (queryType === "availability") {
@@ -1597,48 +2488,84 @@ export default function PatientPortal() {
       data: {
         type: "booking_confirmation",
         title: "Appointment Confirmed",
-        content: { date: dateLabel, time: formatTime12(time), type: "Follow-up", provider: "Dr. Patel" },
+        content: { date: dateLabel, time: formatTime12(time), type: "Follow-up", provider: currentProvider.name },
         recommendation: "Your appointment has been booked. You can view it on the Calendar page.",
       },
       time: "Now",
     } as any]);
   };
 
-  const handleChatSubmit = () => {
+  const handleChatSubmit = async () => {
     if (!chatInput.trim()) return;
     const q = chatInput.toLowerCase();
-    setChatMessages((m) => [...m, { role: "user" as const, content: chatInput, time: "Now" }]);
+    const userMsg = chatInput;
+    setChatMessages((m) => [...m, { role: "user" as const, content: userMsg, time: "Now" }]);
     setChatInput("");
-    setChatLoading(true);
 
-    // Check if this is a notes/history question
-    const notesKeywords = ["note", "visit", "history", "previous", "prescription", "rx", "prescrib", "x-ray", "xray", "imaging", "scan", "ct", "fever", "urgent", "sick", "cardiac", "heart", "pericarditis", "chest pain", "echo", "ecg", "potassium", "k+", "kidney", "renal", "ear", "abscess", "doxycycline", "infection", "abdomen", "nausea", "vomit", "stomach", "gi", "celiac", "gluten", "timeline", "past", "when did", "how many", "allerg", "insurance", "billing", "coverage", "member id", "policy", "demographic", "contact", "phone", "email", "address", "emergency", "personal info", "dob", "date of birth", "age", "social", "smok", "alcohol", "occupation", "exercise", "mental health", "phq", "gad", "depress", "anxiety", "sleep", "stress", "consent", "hipaa", "legal", "telehealth", "payment", "copay", "card on file", "reason for visit", "chief complaint", "pain scale", "symptoms today", "chronic", "condition", "diagnos", "surgery", "hospital", "family history", "medical history", "summary", "overview", "everything", "full profile", "tell me about", "who is"];
-    const isNotesQuery = notesKeywords.some(kw => q.includes(kw));
-
-    if (isNotesQuery) {
-      const notesResp = buildNotesResponse(chatInput);
-      setTimeout(() => {
-        setChatLoading(false);
-        setChatMessages((m) => [...m, { role: "assistant" as const, data: notesResp, time: "Now" } as any]);
-      }, 1500);
-      return;
-    }
-
-    let responseType = "meds";
-    if (q.includes("book") || q.includes("appointment") || q.includes("schedule") || q.includes("availab")) responseType = "availability";
-    else if (q.includes("interact") || q.includes("drug")) responseType = "interactions";
-    else if (q.includes("lab") || q.includes("result") || q.includes("a1c")) responseType = "labs";
-    if (responseType === "availability") {
+    // Booking/availability queries stay structured
+    if (q.includes("book") || q.includes("appointment") || q.includes("schedule") || q.includes("availab")) {
+      setChatLoading(true);
       setTimeout(() => {
         setChatLoading(false);
         const data = getAvailabilityResponse();
         setChatMessages((m) => [...m, { role: "assistant" as const, data, time: "Now" } as any]);
       }, 1800);
-    } else {
-      setTimeout(() => {
-        setChatLoading(false);
-        setChatMessages((m) => [...m, { role: "assistant" as const, data: DEMO_RESPONSES[responseType], time: "Now" } as any]);
-      }, 1800);
+      return;
+    }
+
+    // Everything else goes to GPT
+    setChatLoading(true);
+    try {
+      const history: { role: "user" | "assistant" | "system"; content: string }[] = [];
+      // Inject tool context so AI can synthesize across clinical tools
+      if (toolContext.length > 0) {
+        history.push({ role: "system", content: `[Clinical Tool Activity — reference these results when relevant to the user's question]\n${toolContext.join("\n")}` });
+      }
+      chatMessages
+        .filter((m) => m.role === "user" || (m.role === "assistant" && m.content))
+        .forEach((m) => history.push({ role: m.role as "user" | "assistant", content: m.content || "" }));
+      history.push({ role: "user", content: userMsg });
+
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: history, patientId }),
+      });
+
+      if (!res.ok) throw new Error("API error");
+
+      setChatLoading(false);
+      setChatMessages((m) => [...m, { role: "assistant" as const, content: "", time: "Now" }]);
+
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder();
+      let fullText = "";
+
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          fullText += chunk;
+          const captured = fullText;
+          setChatMessages((prev) => {
+            const updated = [...prev];
+            const last = updated[updated.length - 1];
+            if (last && last.role === "assistant" && !last.data) {
+              updated[updated.length - 1] = { ...last, content: captured };
+            }
+            return updated;
+          });
+        }
+        // Auto-expand chat panel after first AI response
+        if (!chatExpanded) setChatExpanded(true);
+      }
+    } catch {
+      setChatLoading(false);
+      setChatMessages((m) => [
+        ...m,
+        { role: "assistant" as const, content: "Sorry, I couldn't process that request. Please check that your OpenAI API key is configured in .env.local and try again.", time: "Now" },
+      ]);
     }
   };
 
@@ -1653,10 +2580,16 @@ export default function PatientPortal() {
   const topTabs = ["Overview", "Notes & Graphs", "Personal Info", "History", "Documents"];
   const navItems = [
     { label: "Dashboard", icon: <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg> },
-    { label: "Departments", icon: <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0H5m14 0h2M5 21H3m4-10h2m4 0h2m-8 4h2m4 0h2"/></svg> },
     { label: "Staff", icon: <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg> },
-    { label: "Chat", icon: <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg> },
     { label: "Calendar", icon: <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg> },
+  ];
+  const toolNavItems = [
+    { label: "Drug Checker", icon: <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> },
+    { label: "E-Prescribe", icon: <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg> },
+    { label: "ASCVD Risk", icon: <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg> },
+    { label: "Lab Trends", icon: <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg> },
+    { label: "Vitals", icon: <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/><circle cx="12" cy="12" r="1"/></svg> },
+    { label: "Health Radar", icon: <svg fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/><line x1="12" y1="22" x2="12" y2="15.5"/><line x1="22" y1="8.5" x2="15" y2="12"/><line x1="2" y1="8.5" x2="9" y2="12"/></svg> },
   ];
 
   return (
@@ -1665,33 +2598,67 @@ export default function PatientPortal() {
       <aside className="sidebar">
         <div className="sidebar-header">
           <div className="sidebar-logo">
-            <div className="logo-icon">H</div>
+            <div className="logo-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2" /></svg></div>
             Health Monitor <span>Portal</span>
           </div>
         </div>
 
-        <div className="patient-card">
-          <div className="patient-avatar-row">
-            <div className="patient-avatar">GS</div>
-            <div>
-              <div className="patient-name">Gord Sims</div>
-              <div className="patient-dob">Male, 01.25.1967</div>
-            </div>
+        {/* Patient Search & List */}
+        <div className="patient-search">
+          <div style={{ position: "relative" }}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2" style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)" }}>
+              <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            </svg>
+            <input
+              className="patient-search-input"
+              placeholder="Search patients..."
+              value={patientSearch}
+              onChange={(e) => setPatientSearch(e.target.value)}
+            />
           </div>
-          <button className="patient-contact-btn">
-            <svg width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>
-            843-831-5476
-          </button>
-          <div className="patient-meta">
-            <div className="patient-meta-row"><span>Insurance</span><strong>Aetna</strong></div>
-            <div className="patient-meta-row"><span>Member #</span><strong>32523523023</strong></div>
+        </div>
+
+        <div className="patient-list">
+          <div style={{ fontSize: 10, fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: 0.5, padding: "4px 10px", marginBottom: 4 }}>
+            Recent Patients
           </div>
-          <div className="patient-address">3517 Camden Place, New York</div>
-          <div className="patient-polst"><strong>POLST</strong> (10/07/2023) — George Michael</div>
+          {DEMO_PATIENTS
+            .filter(p => p.name.toLowerCase().includes(patientSearch.toLowerCase()))
+            .map(pt => (
+              <button
+                key={pt.id}
+                className={`patient-list-item ${selectedPatientId === pt.id ? "selected" : ""}`}
+                onClick={() => setSelectedPatientId(pt.id)}
+              >
+                <div className="patient-list-avatar" style={{ background: pt.color }}>{pt.initials}</div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "#0f172a" }}>{pt.name}</div>
+                  <div style={{ fontSize: 11, color: "#94a3b8" }}>{pt.sex === "M" ? "Male" : "Female"}, {pt.dob}</div>
+                </div>
+                {pt.concerns > 0 && (
+                  <div style={{ width: 20, height: 20, borderRadius: "50%", background: "#fef2f2", border: "1px solid #fecaca", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#dc2626", flexShrink: 0 }}>
+                    {pt.concerns}
+                  </div>
+                )}
+              </button>
+            ))
+          }
         </div>
 
         <nav className="sidebar-nav">
           {navItems.map((item) => (
+            <button
+              key={item.label}
+              className={`nav-item ${activeNav === item.label ? "active" : ""}`}
+              onClick={() => setActiveNav(item.label)}
+            >
+              {item.icon}
+              {item.label}
+            </button>
+          ))}
+          <div className="nav-separator" />
+          <div className="nav-group-label">Clinical Tools</div>
+          {toolNavItems.map((item) => (
             <button
               key={item.label}
               className={`nav-item ${activeNav === item.label ? "active" : ""}`}
@@ -1711,12 +2678,57 @@ export default function PatientPortal() {
 
       {/* MAIN */}
       <div className="main">
+        {/* Provider Identity Bar */}
+        <div className="provider-bar">
+          <div className="provider-bar-left">
+            <div className="provider-avatar">
+              {currentProvider.name.split(" ")[0][0]}{currentProvider.name.split(" ").slice(-1)[0][0]}
+            </div>
+            <div>
+              <select
+                className="provider-selector"
+                value={currentProvider.name}
+                onChange={(e) => {
+                  const doc = STAFF.doctors.find(d => d.name === e.target.value);
+                  if (doc) setCurrentProvider(doc);
+                }}
+              >
+                {STAFF.doctors.map(doc => (
+                  <option key={doc.name} value={doc.name}>{doc.name}</option>
+                ))}
+              </select>
+              <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 1 }}>
+                {currentProvider.specialty}
+              </div>
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#10b981" }} />
+              <span style={{ fontSize: 11, color: "#94a3b8" }}>Online</span>
+            </div>
+            <span style={{ fontSize: 11, color: "#94a3b8" }}>
+              {new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", year: "numeric" })}
+            </span>
+          </div>
+        </div>
+
         {activeNav === "Calendar" ? (
-          <CalendarView appointments={appointments} onBook={handleBookAppointment} onCancel={handleCancelAppointment} />
-        ) : activeNav === "Chat" ? (
-          <VisitNotesView />
+          <CalendarView appointments={appointments} onBook={handleBookAppointment} onCancel={handleCancelAppointment} selectedPatientId={selectedPatientId} />
         ) : activeNav === "Staff" ? (
           <StaffView />
+        ) : activeNav === "Drug Checker" ? (
+          <DrugInteractionChecker medications={patientInfo.medications} allergies={patientInfo.allergies} patientId={patientId} onToolResult={addToolContext} />
+        ) : activeNav === "E-Prescribe" ? (
+          <EPrescribePad allergies={patientInfo.allergies} currentProvider={currentProvider} patientName={patientInfo.personal?.["Full Legal Name"] || "Patient"} onToolResult={addToolContext} />
+        ) : activeNav === "ASCVD Risk" ? (
+          <ASCVDRiskCalculator patientInfo={patientInfo} setChatOpen={setChatOpen} setChatInput={setChatInput} onToolResult={addToolContext} />
+        ) : activeNav === "Lab Trends" ? (
+          <LabTrendsExplorer />
+        ) : activeNav === "Vitals" ? (
+          <VitalSignsTimeline />
+        ) : activeNav === "Health Radar" ? (
+          <PatientHealthRadar onToolResult={addToolContext} />
         ) : (
         <>
         <div className="top-nav">
@@ -1734,12 +2746,94 @@ export default function PatientPortal() {
         </div>
 
         {activeTab === "Personal Info" ? (
-          <PersonalInfoView />
+          <PersonalInfoView patientInfo={patientInfo} />
+        ) : activeTab === "Notes & Graphs" ? (
+          <VisitNotesView visitNotes={visitNotes} />
         ) : (
         <div className="content">
+          {/* SUMMARY BAR */}
+          <div className="overview-summary">
+            <div className="summary-stat">
+              <div className="summary-stat-icon" style={{ background: "#eff6ff", color: "#3b82f6" }}>
+                <svg width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+              </div>
+              <div>
+                <div className="summary-stat-label">Next Appointment</div>
+                <div className="summary-stat-value">Feb 28, 2026</div>
+              </div>
+            </div>
+            <div className="summary-stat">
+              <div className="summary-stat-icon" style={{ background: "#fef2f2", color: "#ef4444" }}>
+                <svg width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+              </div>
+              <div>
+                <div className="summary-stat-label">Active Concerns</div>
+                <div className="summary-stat-value">4 Issues</div>
+              </div>
+            </div>
+            <div className="summary-stat">
+              <div className="summary-stat-icon" style={{ background: "#ecfdf5", color: "#10b981" }}>
+                <svg width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+              </div>
+              <div>
+                <div className="summary-stat-label">Last Visit</div>
+                <div className="summary-stat-value">Jan 15, 2026</div>
+              </div>
+            </div>
+            <div className="summary-stat">
+              <div className="summary-stat-icon" style={{ background: "#f5f3ff", color: "#8b5cf6" }}>
+                <svg width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M19 21l-7-5-7 5V5a2 2 0 012-2h10a2 2 0 012 2z"/></svg>
+              </div>
+              <div>
+                <div className="summary-stat-label">Active Medications</div>
+                <div className="summary-stat-value">4 Prescriptions</div>
+              </div>
+            </div>
+          </div>
+
+          {/* CLINICAL ALERTS BANNER */}
+          {clinicalAlerts.length > 0 && (
+            <div className="alerts-banner">
+              <div className="alerts-banner-header" onClick={() => setAlertsExpanded(!alertsExpanded)}>
+                <div className="alerts-banner-title">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2">
+                    <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+                    <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+                  </svg>
+                  Clinical Alerts ({clinicalAlerts.length})
+                </div>
+                <button className="alerts-banner-toggle">
+                  {alertsExpanded ? "Collapse" : "Expand"}
+                </button>
+              </div>
+              {alertsExpanded && (
+                <div style={{ marginTop: 4 }}>
+                  {clinicalAlerts.map(alert => (
+                    <div key={alert.id} className="alert-item">
+                      <div className="alert-dot" style={{ background: alert.color }} />
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: "#0f172a" }}>{alert.title}</div>
+                        <div style={{ fontSize: 11, color: "#475569", marginTop: 2, lineHeight: 1.5 }}>{alert.detail}</div>
+                      </div>
+                      <span style={{
+                        fontSize: 9, fontWeight: 700, padding: "2px 8px", borderRadius: 999, textTransform: "uppercase",
+                        background: alert.severity === "critical" ? "#fef2f2" : alert.severity === "warning" ? "#fffbeb" : "#eff6ff",
+                        color: alert.severity === "critical" ? "#dc2626" : alert.severity === "warning" ? "#d97706" : "#2563eb",
+                        border: `1px solid ${alert.severity === "critical" ? "#fecaca" : alert.severity === "warning" ? "#fde68a" : "#bfdbfe"}`,
+                        flexShrink: 0, alignSelf: "flex-start",
+                      }}>
+                        {alert.severity}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* VITALS */}
-          <div className="card vitals-card">
-            <div className="card-title">Vitals <div className="dots"><span></span><span></span></div></div>
+          <div className="card vitals-card card-accent-blue">
+            <div className="card-title">Vitals</div>
             <div className="vitals-grid">
               <div className="vital-item">
                 <div className="vital-label">Weight</div>
@@ -1769,8 +2863,8 @@ export default function PatientPortal() {
           </div>
 
           {/* PROBLEMS */}
-          <div className="card problems-card">
-            <div className="card-title">Problems <div className="dots"><span></span><span></span></div></div>
+          <div className="card problems-card card-accent-red">
+            <div className="card-title">Active Concerns</div>
             <div className="problem-list">
               <div className="problem-item active-problem"><span className="problem-dot red"></span>Abscess of external auditory canal</div>
               <div className="problem-item active-problem"><span className="problem-dot red"></span>Nausea with vomiting</div>
@@ -1780,28 +2874,21 @@ export default function PatientPortal() {
             </div>
           </div>
 
-          {/* ALLERGIES & IMMUNIZATIONS */}
-          <div className="card allergies-card">
-            <div className="allergies-immun-grid">
-              <div>
-                <div className="sub-title">Allergies</div>
-                <div>
-                  <span className="allergy-tag">Peanuts</span>
-                  <span className="allergy-tag">Gluten</span>
-                  <span className="allergy-tag">Penicillin</span>
-                </div>
-              </div>
-              <div>
-                <div className="sub-title">Immunizations</div>
-                <div className="immun-item"><span className="immun-check">✓</span> Influenza (A/V, TIV)</div>
-                <div className="immun-item"><span className="immun-check">✓</span> Pneumococcal (PCV, PPV)</div>
-                <div className="immun-item"><span className="immun-check">✓</span> COVID-19 (Bivalent)</div>
-              </div>
+          {/* LABS */}
+          <div className="card card-accent-teal">
+            <div className="card-title">Latest Labs</div>
+            <div className="labs-grid">
+              <div className="lab-item"><div className="lab-label">Ca</div><div className="lab-value normal">9.4</div><div className="lab-range">8.5-10.5 mg/dL</div></div>
+              <div className="lab-item"><div className="lab-label">Mg</div><div className="lab-value normal">2.1</div><div className="lab-range">1.7-2.2 mg/dL</div></div>
+              <div className="lab-item"><div className="lab-label">K</div><div className="lab-value high">5.8</div><div className="lab-range">3.5-5.0 mEq/L</div></div>
+              <div className="lab-item"><div className="lab-label">Na</div><div className="lab-value normal">140</div><div className="lab-range">136-145 mEq/L</div></div>
+              <div className="lab-item"><div className="lab-label">Cu</div><div className="lab-value low">62</div><div className="lab-range">70-140 ug/dL</div></div>
+              <div className="lab-item"><div className="lab-label">Cl</div><div className="lab-value normal">101</div><div className="lab-range">96-106 mEq/L</div></div>
             </div>
           </div>
 
           {/* MEDICATIONS */}
-          <div className="card medications-card">
+          <div className="card medications-card card-accent-purple">
             <div className="card-title">Medications</div>
             <div className="med-list">
               <div className="med-item">
@@ -1823,24 +2910,30 @@ export default function PatientPortal() {
             </div>
           </div>
 
-          {/* RIGHT COLUMN */}
-          <div className="right-col">
-            {/* Labs */}
-            <div className="card">
-              <div className="card-title">Latest Investigations — Labs</div>
-              <div className="labs-grid">
-                <div className="lab-item"><div className="lab-label">Ca</div><div className="lab-value normal">9.4</div><div className="lab-range">8.5–10.5 mg/dL</div></div>
-                <div className="lab-item"><div className="lab-label">Mg</div><div className="lab-value normal">2.1</div><div className="lab-range">1.7–2.2 mg/dL</div></div>
-                <div className="lab-item"><div className="lab-label">K</div><div className="lab-value high">5.8</div><div className="lab-range">3.5–5.0 mEq/L</div></div>
-                <div className="lab-item"><div className="lab-label">Na</div><div className="lab-value normal">140</div><div className="lab-range">136–145 mEq/L</div></div>
-                <div className="lab-item"><div className="lab-label">Cu</div><div className="lab-value low">62</div><div className="lab-range">70–140 µg/dL</div></div>
-                <div className="lab-item"><div className="lab-label">Cl</div><div className="lab-value normal">101</div><div className="lab-range">96–106 mEq/L</div></div>
+          {/* ALLERGIES & IMMUNIZATIONS */}
+          <div className="card allergies-card card-accent-orange">
+            <div className="allergies-immun-grid">
+              <div>
+                <div className="sub-title">Allergies</div>
+                <div>
+                  <span className="allergy-tag">Peanuts</span>
+                  <span className="allergy-tag">Gluten</span>
+                  <span className="allergy-tag">Penicillin</span>
+                </div>
+              </div>
+              <div>
+                <div className="sub-title">Immunizations</div>
+                <div className="immun-item"><span className="immun-check">✓</span> Influenza (A/V, TIV)</div>
+                <div className="immun-item"><span className="immun-check">✓</span> Pneumococcal (PCV, PPV)</div>
+                <div className="immun-item"><span className="immun-check">✓</span> COVID-19 (Bivalent)</div>
               </div>
             </div>
+          </div>
 
-            {/* Pulmonary Function */}
-            <div className="card">
-              <div className="card-title">Pulmonary Function Tx</div>
+          {/* BOTTOM ROW: Pulmonary + Imaging */}
+          <div className="overview-bottom-row">
+            <div className="card card-accent-green">
+              <div className="card-title">Pulmonary Function</div>
               <div className="pulm-results">
                 <div>
                   <div className="pulm-row"><span className="label">FEV1</span><span className="value">78%</span></div>
@@ -1857,21 +2950,20 @@ export default function PatientPortal() {
               </div>
             </div>
 
-            {/* Imaging */}
             <div className="card imaging-card">
               <div className="card-title">Imaging</div>
               <div className="imaging-item">
                 <div className="imaging-thumb"><div className="xray-placeholder"></div></div>
                 <div className="imaging-info">
                   <div className="imaging-date">Sept 2025</div>
-                  <div className="imaging-desc">Chest X-ray — Observed bilateral findings consistent with early emphysema</div>
+                  <div className="imaging-desc">Chest X-ray -- Bilateral findings consistent with early emphysema</div>
                 </div>
               </div>
               <div className="imaging-item">
                 <div className="imaging-thumb"><div className="xray-placeholder"></div></div>
                 <div className="imaging-info">
                   <div className="imaging-date">Aug 2025</div>
-                  <div className="imaging-desc">Abdominal CT — Small bowel pattern unremarkable</div>
+                  <div className="imaging-desc">Abdominal CT -- Small bowel pattern unremarkable</div>
                 </div>
               </div>
             </div>
@@ -1887,19 +2979,31 @@ export default function PatientPortal() {
         <div
           style={{
             position: "fixed",
-            bottom: 96,
-            right: 28,
-            width: 420,
-            height: 560,
+            ...(chatExpanded ? {
+              top: 0,
+              right: 0,
+              width: "40vw",
+              minWidth: 380,
+              height: "100vh",
+              borderRadius: 0,
+              borderLeft: "1px solid #e2e8f0",
+            } : {
+              bottom: 96,
+              right: 28,
+              width: 420,
+              height: 560,
+              borderRadius: 16,
+              border: "1px solid #e2e8f0",
+            }),
             zIndex: 1000,
-            borderRadius: 16,
             overflow: "hidden",
             display: "flex",
             flexDirection: "column",
             background: "#ffffff",
-            border: "1px solid #e2e8f0",
-            boxShadow: "0 20px 60px rgba(0,0,0,0.12), 0 8px 24px rgba(0,0,0,0.08)",
-            animation: "slideUp 0.3s ease",
+            boxShadow: chatExpanded
+              ? "-4px 0 24px rgba(0,0,0,0.08)"
+              : "0 20px 60px rgba(0,0,0,0.12), 0 8px 24px rgba(0,0,0,0.08)",
+            transition: "all 0.35s cubic-bezier(0.16, 1, 0.3, 1)",
           }}
         >
           {/* Chat Header */}
@@ -1913,9 +3017,59 @@ export default function PatientPortal() {
                 <div style={{ fontSize: 10, color: "#9ca3af" }}>Clinical Decision Support</div>
               </div>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#10b981" }} />
-              <span style={{ fontSize: 10, color: "#6b7280" }}>FHIR Connected</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#10b981" }} />
+                <span style={{ fontSize: 10, color: "#6b7280" }}>FHIR Connected</span>
+              </div>
+              {chatExpanded && (
+                <button
+                  onClick={() => setChatExpanded(false)}
+                  title="Minimize"
+                  style={{
+                    background: "none",
+                    border: "1px solid #e2e8f0",
+                    borderRadius: 6,
+                    padding: "4px 8px",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 4,
+                    fontSize: 11,
+                    fontWeight: 600,
+                    color: "#64748b",
+                    fontFamily: "inherit",
+                    transition: "background 0.15s",
+                  }}
+                  onMouseEnter={e => (e.currentTarget.style.background = "#f1f5f9")}
+                  onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+                  Minimize
+                </button>
+              )}
+              {!chatExpanded && chatMessages.length > 2 && (
+                <button
+                  onClick={() => setChatExpanded(true)}
+                  title="Expand"
+                  style={{
+                    background: "none",
+                    border: "1px solid #e2e8f0",
+                    borderRadius: 6,
+                    padding: "4px 6px",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    color: "#64748b",
+                    fontFamily: "inherit",
+                    transition: "background 0.15s",
+                  }}
+                  onMouseEnter={e => (e.currentTarget.style.background = "#f1f5f9")}
+                  onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+                </button>
+              )}
             </div>
           </div>
 
@@ -1938,13 +3092,22 @@ export default function PatientPortal() {
                       <p style={{ fontSize: 13, color: "#374151", margin: 0 }}>{msg.content}</p>
                     </div>
                   </div>
-                ) : (
+                ) : (msg as any).data ? (
                   <div style={{ display: "flex", gap: 8 }}>
                     <div style={{ width: 24, height: 24, minWidth: 24, borderRadius: "50%", background: "#f1f5f9", border: "1px solid #e2e8f0", display: "flex", alignItems: "center", justifyContent: "center", marginTop: 2 }}>
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" strokeWidth="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2" /></svg>
                     </div>
                     <div style={{ flex: 1, maxWidth: "85%" }}>
                       <ResponseCard data={(msg as any).data} onBookSlot={handleChatBooking} />
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <div style={{ width: 24, height: 24, minWidth: 24, borderRadius: "50%", background: "#f1f5f9", border: "1px solid #e2e8f0", display: "flex", alignItems: "center", justifyContent: "center", marginTop: 2 }}>
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" strokeWidth="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2" /></svg>
+                    </div>
+                    <div style={{ background: "#ffffff", border: "1px solid #e5e7eb", borderRadius: "16px 16px 16px 4px", padding: "10px 14px", maxWidth: "85%" }}>
+                      {renderAIText(msg.content || "")}
                     </div>
                   </div>
                 )}
@@ -2026,17 +3189,17 @@ export default function PatientPortal() {
         </div>
       )}
 
-      {/* Floating Chat Toggle Button */}
+      {/* Floating Chat Toggle Button — hidden when expanded */}
       <div
-        onClick={() => setChatOpen(!chatOpen)}
+        onClick={() => { if (chatOpen && chatExpanded) { setChatExpanded(false); setChatOpen(false); } else { setChatOpen(!chatOpen); } }}
         onMouseEnter={() => setChatHovered(true)}
         onMouseLeave={() => setChatHovered(false)}
         style={{
           position: "fixed",
           bottom: 28,
-          right: 28,
+          right: chatExpanded && chatOpen ? "calc(25vw / 2 - 28px)" : 28,
           zIndex: 1001,
-          display: "flex",
+          display: chatExpanded && chatOpen ? "none" : "flex",
           alignItems: "center",
           gap: 10,
           cursor: "pointer",
