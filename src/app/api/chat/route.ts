@@ -1,7 +1,6 @@
-import * as ai from "ai";
+import { streamText, tool, stepCountIs } from "ai";
 import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
-import { wrapAISDK } from "langsmith/experimental/vercel";
 import { buildSystemPrompt } from "@/lib/system-prompt";
 import { fetchPatientData } from "@/lib/fhir/fetch-patient";
 import {
@@ -11,10 +10,6 @@ import {
   appointmentAvailability,
   insuranceCoverageCheck,
 } from "@/lib/clinical-tools";
-
-// Wrap AI SDK with LangSmith tracing — automatically traces
-// streamText, generateText, and all tool executions
-const { streamText } = wrapAISDK(ai, { name: "MedAssist Chat" });
 
 export async function POST(req: Request) {
   const { messages, patientId } = await req.json();
@@ -26,9 +21,9 @@ export async function POST(req: Request) {
     system: buildSystemPrompt(patientInfo, visitNotes),
     messages,
     temperature: 0.3,
-    stopWhen: ai.stepCountIs(3),
+    stopWhen: stepCountIs(3),
     tools: {
-      drug_interaction_check: ai.tool({
+      drug_interaction_check: tool({
         description:
           "Check for drug-drug interactions and allergy conflicts for a list of medications. Use this when the user asks about drug interactions, medication safety, or whether medications can be taken together.",
         inputSchema: z.object({
@@ -39,7 +34,7 @@ export async function POST(req: Request) {
         execute: async ({ medications }) => drugInteractionCheck(medications),
       }),
 
-      symptom_lookup: ai.tool({
+      symptom_lookup: tool({
         description:
           "Look up possible conditions based on patient symptoms, considering the current patient's medical history. Use this when the user describes symptoms or asks what could be causing certain symptoms.",
         inputSchema: z.object({
@@ -50,7 +45,7 @@ export async function POST(req: Request) {
         execute: async ({ symptoms }) => symptomLookup(symptoms),
       }),
 
-      provider_search: ai.tool({
+      provider_search: tool({
         description:
           "Search for healthcare providers by specialty or role. Use this when the user asks about available doctors, nurses, or staff, or needs a referral to a specialist.",
         inputSchema: z.object({
@@ -65,7 +60,7 @@ export async function POST(req: Request) {
         execute: async ({ specialty, location }) => providerSearch(specialty, location),
       }),
 
-      appointment_availability: ai.tool({
+      appointment_availability: tool({
         description:
           "Check available appointment slots for a specific provider within a date range. Use this when the user asks about scheduling, availability, or booking an appointment.",
         inputSchema: z.object({
@@ -83,7 +78,7 @@ export async function POST(req: Request) {
           appointmentAvailability(provider_name, start_date, end_date),
       }),
 
-      insurance_coverage_check: ai.tool({
+      insurance_coverage_check: tool({
         description:
           "Check insurance coverage for a specific medical procedure using CPT/HCPCS codes. Use this when the user asks about insurance coverage, copays, prior authorization, or whether a procedure is covered. Common codes: 99213 (office visit), 80053 (CMP lab), 93306 (echo), 74178 (CT abdomen), 43239 (endoscopy), 94010 (PFT).",
         inputSchema: z.object({
