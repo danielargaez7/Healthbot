@@ -3141,7 +3141,7 @@ export default function PatientPortal() {
           </div>
 
           {/* Quick Actions */}
-          <div style={{ padding: "6px 14px", display: "flex", gap: 6, flexWrap: "wrap", background: "#ffffff" }}>
+          <div style={{ padding: "6px 14px", display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "center", background: "#ffffff" }}>
             {quickActions.map((a) => (
               <button
                 key={a.key}

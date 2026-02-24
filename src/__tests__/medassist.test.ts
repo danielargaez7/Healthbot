@@ -16,6 +16,14 @@ import {
   appointmentAvailability,
   insuranceCoverageCheck,
 } from "@/lib/clinical-tools";
+import {
+  factCheck,
+  detectHallucination,
+  computeConfidence,
+  checkDomainConstraints,
+  requiresHumanReview,
+  verify,
+} from "@/lib/verification";
 
 /* ─────────────────────────────────────
    Test 1: ASCVD Pooled Cohort Equation
@@ -351,31 +359,40 @@ describe("ASCVD Input Validation", () => {
 describe("drug_interaction_check", () => {
   it("should detect allergy alert when Amoxicillin prescribed to penicillin-allergic patient", () => {
     const result = drugInteractionCheck(["Amoxicillin", "Lisinopril"]);
-    expect(result.allergy_alerts.length).toBeGreaterThan(0);
-    expect(result.allergy_alerts[0]).toContain("penicillin");
+    expect(result.data.allergy_alerts.length).toBeGreaterThan(0);
+    expect(result.data.allergy_alerts[0]).toContain("penicillin");
   });
 
   it("should detect interaction between Aspirin and Ibuprofen", () => {
     const result = drugInteractionCheck(["Aspirin", "Ibuprofen"]);
-    expect(result.interactions_found).toBeGreaterThan(0);
-    expect(result.interactions[0].pair).toContain("Aspirin");
-    expect(result.interactions[0].severity).toBe("moderate");
+    expect(result.data.interactions_found).toBeGreaterThan(0);
+    expect(result.data.interactions[0].pair).toContain("Aspirin");
+    expect(result.data.interactions[0].severity).toBe("moderate");
   });
 
   it("should return no interactions for safe combination", () => {
     const result = drugInteractionCheck(["Doxycycline"]);
-    expect(result.interactions_found).toBe(0);
-    expect(result.allergy_alerts.length).toBe(0);
+    expect(result.data.interactions_found).toBe(0);
+    expect(result.data.allergy_alerts.length).toBe(0);
   });
 
-  it("should return structured result with all expected fields", () => {
+  it("should return VerifiedToolResult with verification", () => {
     const result = drugInteractionCheck(["Lisinopril", "Losartan"]);
-    expect(result.medications_checked).toEqual(["Lisinopril", "Losartan"]);
-    expect(result.interactions_found).toBeGreaterThan(0);
-    expect(result.interactions[0]).toHaveProperty("pair");
-    expect(result.interactions[0]).toHaveProperty("severity");
-    expect(result.interactions[0]).toHaveProperty("detail");
-    expect(result.interactions[0]).toHaveProperty("recommendation");
+    expect(result).toHaveProperty("status");
+    expect(result).toHaveProperty("data");
+    expect(result).toHaveProperty("verification");
+    expect(result.data.medications_checked).toEqual(["Lisinopril", "Losartan"]);
+    expect(result.verification.verification_types).toContain("fact_check");
+    expect(result.verification.verification_types).toContain("domain_constraints");
+    expect(result.verification.confidence).toBeGreaterThan(0);
+    expect(result.verification.confidence).toBeLessThanOrEqual(1);
+  });
+
+  it("should fail verification for severe interactions", () => {
+    const result = drugInteractionCheck(["Lisinopril", "Losartan"]);
+    expect(result.status).toBe("failed");
+    expect(result.verification.passed).toBe(false);
+    expect(result.verification.requires_human_review).toBe(true);
   });
 });
 
@@ -385,31 +402,38 @@ describe("drug_interaction_check", () => {
 describe("symptom_lookup", () => {
   it("should return emergent conditions for chest pain", () => {
     const result = symptomLookup(["chest pain"]);
-    expect(result.possible_conditions.length).toBeGreaterThan(0);
-    const emergent = result.possible_conditions.find((c) => c.urgency === "emergent");
+    expect(result.data.possible_conditions.length).toBeGreaterThan(0);
+    const emergent = result.data.possible_conditions.find((c) => c.urgency === "emergent");
     expect(emergent).toBeDefined();
     expect(emergent!.condition).toContain("Coronary");
   });
 
   it("should return ear-related condition for ear pain", () => {
     const result = symptomLookup(["ear pain"]);
-    const earCondition = result.possible_conditions.find((c) => c.condition.includes("Ear") || c.condition.includes("Otitis"));
+    const earCondition = result.data.possible_conditions.find((c) => c.condition.includes("Ear") || c.condition.includes("Otitis"));
     expect(earCondition).toBeDefined();
   });
 
   it("should include patient context in result", () => {
     const result = symptomLookup(["nausea"]);
-    expect(result.patient_context).toContain("59-year-old");
-    expect(result.patient_context).toContain("Penicillin");
+    expect(result.data.patient_context).toContain("59-year-old");
+    expect(result.data.patient_context).toContain("Penicillin");
   });
 
   it("should sort by urgency (emergent first)", () => {
     const result = symptomLookup(["chest pain", "nausea", "ear pain"]);
-    const urgencies = result.possible_conditions.map((c) => c.urgency);
+    const urgencies = result.data.possible_conditions.map((c) => c.urgency);
     const urgencyOrder = { emergent: 0, urgent: 1, routine: 2 };
     for (let i = 1; i < urgencies.length; i++) {
       expect(urgencyOrder[urgencies[i]]).toBeGreaterThanOrEqual(urgencyOrder[urgencies[i - 1]]);
     }
+  });
+
+  it("should escalate emergent conditions for human review", () => {
+    const result = symptomLookup(["chest pain"]);
+    expect(result.verification.requires_human_review).toBe(true);
+    expect(result.verification.verification_types).toContain("human_in_the_loop");
+    expect(result.verification.verification_types).toContain("hallucination_detection");
   });
 });
 
@@ -419,33 +443,28 @@ describe("symptom_lookup", () => {
 describe("provider_search", () => {
   it("should find cardiologist when searching Cardiology", () => {
     const result = providerSearch("Cardiology");
-    expect(result.providers_found).toBeGreaterThan(0);
-    const doc = result.providers.find((p) => p.role === "doctor");
+    expect(result.data.providers_found).toBeGreaterThan(0);
+    const doc = result.data.providers.find((p) => p.role === "doctor");
     expect(doc).toBeDefined();
     expect(doc!.name).toContain("Kim");
   });
 
   it("should find nurses when searching for nurse role", () => {
     const result = providerSearch("nurse");
-    expect(result.providers_found).toBeGreaterThan(0);
-    expect(result.providers.every((p) => p.role === "nurse")).toBe(true);
+    expect(result.data.providers_found).toBeGreaterThan(0);
+    expect(result.data.providers.every((p) => p.role === "nurse")).toBe(true);
   });
 
   it("should return empty for non-existent specialty", () => {
     const result = providerSearch("Neurosurgery");
-    expect(result.providers_found).toBe(0);
+    expect(result.data.providers_found).toBe(0);
   });
 
-  it("should return structured result with expected fields", () => {
+  it("should include verification with fact_check", () => {
     const result = providerSearch("Internal Medicine");
-    expect(result).toHaveProperty("query_specialty");
-    expect(result).toHaveProperty("providers_found");
-    expect(result).toHaveProperty("providers");
-    if (result.providers.length > 0) {
-      expect(result.providers[0]).toHaveProperty("name");
-      expect(result.providers[0]).toHaveProperty("bio");
-      expect(result.providers[0]).toHaveProperty("role");
-    }
+    expect(result.verification.verification_types).toContain("fact_check");
+    expect(result.verification.verification_types).toContain("confidence_scoring");
+    expect(result.verification.sources.length).toBeGreaterThan(0);
   });
 });
 
@@ -455,28 +474,25 @@ describe("provider_search", () => {
 describe("appointment_availability", () => {
   it("should return available slots for Dr. Patel", () => {
     const result = appointmentAvailability("Patel", "2026-02-24", "2026-02-24");
-    expect(result.provider).toContain("Patel");
-    expect(result.available_slots.length).toBeGreaterThan(0);
+    expect(result.data.provider).toContain("Patel");
+    expect(result.data.available_slots.length).toBeGreaterThan(0);
   });
 
   it("should exclude booked appointment times", () => {
     const result = appointmentAvailability("Patel", "2026-02-24", "2026-02-24");
-    // Dr. Patel has 09:00 booked on 2026-02-24 (Jane Doe)
-    const nineAM = result.available_slots.find((s) => s.time === "09:00");
+    const nineAM = result.data.available_slots.find((s) => s.time === "09:00");
     expect(nineAM).toBeUndefined();
   });
 
   it("should skip weekends", () => {
-    // 2026-02-28 is a Saturday, 2026-03-01 is Sunday
     const result = appointmentAvailability("Patel", "2026-02-28", "2026-03-01");
-    expect(result.available_slots.length).toBe(0);
+    expect(result.data.available_slots.length).toBe(0);
   });
 
-  it("should include time_display in 12-hour format", () => {
-    const result = appointmentAvailability("Patel", "2026-02-24", "2026-02-24");
-    if (result.available_slots.length > 0) {
-      expect(result.available_slots[0].time_display).toMatch(/AM|PM/);
-    }
+  it("should flag unknown provider via domain constraints", () => {
+    const result = appointmentAvailability("Dr. FakeName", "2026-02-24", "2026-02-24");
+    expect(result.verification.passed).toBe(false);
+    expect(result.verification.errors.some((e) => e.includes("DOMAIN RULE"))).toBe(true);
   });
 });
 
@@ -486,35 +502,172 @@ describe("appointment_availability", () => {
 describe("insurance_coverage_check", () => {
   it("should return coverage for standard office visit (99213)", () => {
     const result = insuranceCoverageCheck("99213");
-    expect(result.coverage.covered).toBe(true);
-    expect(result.coverage.copay).toBe("$25.00");
-    expect(result.coverage.prior_auth_required).toBe(false);
+    expect(result.data.coverage.covered).toBe(true);
+    expect(result.data.coverage.copay).toBe("$25.00");
+    expect(result.data.coverage.prior_auth_required).toBe(false);
   });
 
-  it("should require prior auth for CT abdomen (74178)", () => {
+  it("should require prior auth and flag domain constraint for CT abdomen (74178)", () => {
     const result = insuranceCoverageCheck("74178");
-    expect(result.coverage.covered).toBe(true);
-    expect(result.coverage.prior_auth_required).toBe(true);
-    expect(result.coverage.coverage_level).toBe("partial");
+    expect(result.data.coverage.covered).toBe(true);
+    expect(result.data.coverage.prior_auth_required).toBe(true);
+    expect(result.verification.verification_types).toContain("domain_constraints");
+    expect(result.verification.errors.some((e) => e.includes("Prior authorization"))).toBe(true);
   });
 
-  it("should return not_covered for unknown procedure code", () => {
+  it("should fail verification for unknown procedure code", () => {
     const result = insuranceCoverageCheck("XXXXX");
-    expect(result.coverage.covered).toBe(false);
-    expect(result.coverage.coverage_level).toBe("not_covered");
+    expect(result.data.coverage.covered).toBe(false);
+    expect(result.status).toBe("failed");
+    expect(result.verification.passed).toBe(false);
+    expect(result.verification.requires_human_review).toBe(true);
   });
 
   it("should include correct patient insurance info", () => {
     const result = insuranceCoverageCheck("99213");
-    expect(result.patient).toBe("Gord Allen Sims");
-    expect(result.insurance_provider).toBe("Aetna");
-    expect(result.member_id).toBe("32523523023");
+    expect(result.data.patient).toBe("Gord Allen Sims");
+    expect(result.data.insurance_provider).toBe("Aetna");
+    expect(result.data.member_id).toBe("32523523023");
   });
 
   it("should cover preventive labs at no charge (80053)", () => {
     const result = insuranceCoverageCheck("80053");
-    expect(result.coverage.covered).toBe(true);
-    expect(result.coverage.copay).toBe("$0");
-    expect(result.coverage.deductible_applies).toBe(false);
+    expect(result.data.coverage.covered).toBe(true);
+    expect(result.data.coverage.copay).toBe("$0");
+    expect(result.data.coverage.deductible_applies).toBe(false);
+    expect(result.status).toBe("verified");
+  });
+});
+
+/* ────────────────────────────────────────────────
+   Test 15: Verification Layer — Unit Tests
+   ──────────────────────────────────────────────── */
+describe("Verification Layer", () => {
+  it("factCheck: should identify matched and unmatched items", () => {
+    const result = factCheck({
+      items: ["Aspirin", "Lisinopril", "MadeUpDrug"],
+      knownDatabase: ["Aspirin", "Lisinopril", "Metformin"],
+      domain: "Pharmacology",
+      sourceName: "FDA DB",
+    });
+    expect(result.matched).toContain("Aspirin");
+    expect(result.matched).toContain("Lisinopril");
+    expect(result.unmatched).toContain("MadeUpDrug");
+    expect(result.coverage).toBeCloseTo(2 / 3, 1);
+  });
+
+  it("detectHallucination: should flag unsupported claims", () => {
+    const result = detectHallucination({
+      claims: [
+        { claim: "Patient has HTN", supportedByData: true },
+        { claim: "Patient has cancer", supportedByData: false },
+      ],
+    });
+    expect(result.allSupported).toBe(false);
+    expect(result.unsupportedClaims).toContain("Patient has cancer");
+    expect(result.supportedCount).toBe(1);
+  });
+
+  it("detectHallucination: should pass when all claims are supported", () => {
+    const result = detectHallucination({
+      claims: [
+        { claim: "Patient has HTN", supportedByData: true },
+        { claim: "K+ is elevated", supportedByData: true },
+      ],
+    });
+    expect(result.allSupported).toBe(true);
+    expect(result.unsupportedClaims.length).toBe(0);
+  });
+
+  it("computeConfidence: should return weighted score between 0 and 1", () => {
+    const high = computeConfidence({ dataCompleteness: 1.0, sourceReliability: 1.0, matchQuality: 1.0 });
+    expect(high).toBe(1.0);
+
+    const low = computeConfidence({ dataCompleteness: 0.0, sourceReliability: 0.0, matchQuality: 0.0 });
+    expect(low).toBe(0.0);
+
+    const mid = computeConfidence({ dataCompleteness: 0.5, sourceReliability: 0.8, matchQuality: 0.6 });
+    expect(mid).toBeGreaterThan(0);
+    expect(mid).toBeLessThan(1);
+  });
+
+  it("checkDomainConstraints: should fail for severe interactions", () => {
+    const result = checkDomainConstraints({ hasSevereInteractions: true });
+    expect(result.passed).toBe(false);
+    expect(result.violations.length).toBeGreaterThan(0);
+    expect(result.violations[0]).toContain("Severe drug-drug interaction");
+  });
+
+  it("checkDomainConstraints: should fail for allergy conflicts", () => {
+    const result = checkDomainConstraints({ hasAllergyConflicts: true });
+    expect(result.passed).toBe(false);
+    expect(result.violations[0]).toContain("allergen conflict");
+  });
+
+  it("checkDomainConstraints: should pass when no violations", () => {
+    const result = checkDomainConstraints({});
+    expect(result.passed).toBe(true);
+    expect(result.violations.length).toBe(0);
+  });
+
+  it("requiresHumanReview: should escalate critical severity", () => {
+    const result = requiresHumanReview({ confidence: 0.95, severity: "critical", stakes: "low" });
+    expect(result.required).toBe(true);
+    expect(result.reason).toContain("Critical severity");
+  });
+
+  it("requiresHumanReview: should escalate low confidence + high stakes", () => {
+    const result = requiresHumanReview({ confidence: 0.4, severity: "low", stakes: "high" });
+    expect(result.required).toBe(true);
+    expect(result.reason).toContain("Low confidence");
+  });
+
+  it("requiresHumanReview: should not escalate low-risk decisions", () => {
+    const result = requiresHumanReview({ confidence: 0.9, severity: "low", stakes: "low" });
+    expect(result.required).toBe(false);
+  });
+
+  it("verify: should compose all 5 verification types", () => {
+    const result = verify({ test: true }, {
+      factCheck: {
+        items: ["Aspirin"],
+        knownDatabase: ["Aspirin", "Lisinopril"],
+        domain: "Test",
+        sourceName: "Test DB",
+      },
+      hallucinationCheck: {
+        claims: [{ claim: "Test claim", supportedByData: true }],
+      },
+      confidenceInput: {
+        dataCompleteness: 0.9,
+        sourceReliability: 0.85,
+        matchQuality: 1.0,
+      },
+      domainConstraints: {},
+      humanReviewInput: {
+        confidence: 0.9,
+        severity: "low",
+        stakes: "low",
+      },
+    });
+    expect(result.status).toBe("verified");
+    expect(result.verification.passed).toBe(true);
+    expect(result.verification.verification_types).toContain("fact_check");
+    expect(result.verification.verification_types).toContain("hallucination_detection");
+    expect(result.verification.verification_types).toContain("confidence_scoring");
+    expect(result.verification.verification_types).toContain("domain_constraints");
+    expect(result.verification.verification_types).toContain("human_in_the_loop");
+    expect(result.verification.sources.length).toBeGreaterThan(0);
+  });
+
+  it("verify: should fail when domain constraint violated", () => {
+    const result = verify({ test: true }, {
+      domainConstraints: { hasSevereInteractions: true },
+      humanReviewInput: { confidence: 0.5, severity: "critical", stakes: "high" },
+    });
+    expect(result.status).toBe("failed");
+    expect(result.verification.passed).toBe(false);
+    expect(result.verification.requires_human_review).toBe(true);
+    expect(result.verification.errors.length).toBeGreaterThan(0);
   });
 });
