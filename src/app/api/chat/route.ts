@@ -1,4 +1,4 @@
-import { streamText, tool, stepCountIs } from "ai";
+import { streamText, tool, stepCountIs } from "@/lib/ai";
 import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
 import { buildSystemPrompt } from "@/lib/system-prompt";

@@ -1,9 +1,6 @@
-import { wrapAISDK } from "braintrust";
-import * as ai from "ai";
-
-// Next.js calls register() on server startup when instrumentationHook is enabled.
-// Wraps the Vercel AI SDK so every streamText / generateText call
-// is automatically traced to Braintrust (when BRAINTRUST_API_KEY is set).
+// Next.js instrumentation hook — runs on server startup.
+// Braintrust tracing is handled via the wrapped AI SDK in src/lib/ai.ts.
+// This file is kept for future observability extensions.
 export function register() {
-  wrapAISDK(ai);
+  // Braintrust wrapAISDK is applied in src/lib/ai.ts at import time
 }

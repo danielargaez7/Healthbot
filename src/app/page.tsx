@@ -17,6 +17,28 @@ const renderAIText = (text: string) => {
   const lines = text.split("\n");
   return lines.map((line, i) => {
     if (!line.trim()) return <br key={i} />;
+    // Alert banners — orange for alerts, red for warnings/critical
+    const alertMatch = line.match(/^(#{2,3}\s+)?(\*\*)?(?:⚠️?\s*)?(Allergy Alert|Alert|ALLERGY ALERT|ALERT|Caution|CAUTION|Notice)(\*\*)?(\s*[:!—-]?\s*)(.*)/i);
+    const warningMatch = !alertMatch && line.match(/^(#{2,3}\s+)?(\*\*)?(?:⚠️?\s*)?(Warning|WARNING|DOMAIN RULE VIOLATION|CRITICAL|CONTRAINDICATED|Do NOT)(\*\*)?(\s*[:!—-]?\s*)(.*)/i);
+    if (alertMatch) {
+      const label = alertMatch[3];
+      const rest = alertMatch[6] || "";
+      return <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 6, margin: "8px 0 4px", padding: "6px 10px", background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8 }}>
+        <span style={{ fontSize: 14, marginTop: 1 }}>⚠</span>
+        <span style={{ fontSize: 13, lineHeight: 1.5 }}>
+          <strong style={{ color: "#d97706", fontWeight: 700 }}>{label}</strong>
+          {rest && <span style={{ color: "#374151" }} dangerouslySetInnerHTML={{ __html: ": " + inlineMd(rest) }} />}
+        </span>
+      </div>;
+    }
+    if (warningMatch) {
+      const label = warningMatch[3];
+      const rest = warningMatch[6] || "";
+      return <p key={i} style={{ fontSize: 13, margin: "2px 0", lineHeight: 1.5 }}>
+        <strong style={{ color: "#dc2626", fontWeight: 700 }}>{label}</strong>
+        {rest && <span style={{ color: "#374151" }} dangerouslySetInnerHTML={{ __html: ": " + inlineMd(rest) }} />}
+      </p>;
+    }
     // Headers
     if (line.startsWith("### ")) return <h4 key={i} style={{ fontSize: 13, fontWeight: 700, color: "#1e293b", margin: "8px 0 4px" }}>{line.slice(4)}</h4>;
     if (line.startsWith("## ")) return <h3 key={i} style={{ fontSize: 14, fontWeight: 700, color: "#1e293b", margin: "8px 0 4px" }}>{line.slice(3)}</h3>;
@@ -33,7 +55,9 @@ const inlineMd = (text: string) =>
   text
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/\*(.+?)\*/g, "<em>$1</em>")
-    .replace(/`(.+?)`/g, '<code style="background:#f1f5f9;padding:1px 4px;border-radius:3px;font-size:12px">$1</code>');
+    .replace(/`(.+?)`/g, '<code style="background:#f1f5f9;padding:1px 4px;border-radius:3px;font-size:12px">$1</code>')
+    .replace(/\b(Warning|WARNING|CRITICAL|CONTRAINDICATED|DOMAIN RULE VIOLATION)\b/g, '<strong style="color:#dc2626;font-weight:700">$1</strong>')
+    .replace(/\b(Allergy Alert|ALLERGY ALERT|Alert|ALERT|Caution|CAUTION)\b/g, '<strong style="color:#d97706;font-weight:700">$1</strong>');
 
 /* Data constants imported from @/lib/patient-data */
 
@@ -2322,6 +2346,11 @@ export default function PatientPortal() {
     setAuthChecked(true);
   }, [router]);
 
+  const handleLogout = () => {
+    localStorage.removeItem("medassist-auth");
+    router.replace("/login");
+  };
+
   const [activeTab, setActiveTab] = useState("Overview");
   const [chatHovered, setChatHovered] = useState(false);
   const [activeNav, setActiveNav] = useState("Dashboard");
@@ -2726,6 +2755,15 @@ export default function PatientPortal() {
             <span style={{ fontSize: 11, color: "#94a3b8" }}>
               {new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric", year: "numeric" })}
             </span>
+            <button
+              onClick={handleLogout}
+              style={{ fontSize: 11, color: "#94a3b8", background: "none", border: "1px solid #e2e8f0", borderRadius: 6, padding: "4px 10px", cursor: "pointer", display: "flex", alignItems: "center", gap: 4 }}
+              onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.color = "#dc2626"; (e.currentTarget as HTMLButtonElement).style.borderColor = "#fecaca"; }}
+              onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.color = "#94a3b8"; (e.currentTarget as HTMLButtonElement).style.borderColor = "#e2e8f0"; }}
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+              Log out
+            </button>
           </div>
         </div>
 
