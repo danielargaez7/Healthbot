@@ -11,10 +11,26 @@ import {
   insuranceCoverageCheck,
 } from "@/lib/clinical-tools";
 
+// In-memory store for tool calls (keyed by request ID, auto-expires after 30s)
+const toolCallStore = new Map<string, Array<{ toolName: string; args: unknown; result: unknown }>>();
+
 export async function POST(req: Request) {
-  const { messages, patientId } = await req.json();
+  const { messages, patientId, fetchToolCalls } = await req.json();
+
+  // Second call: client fetching tool calls after stream completes
+  if (fetchToolCalls && toolCallStore.has(fetchToolCalls)) {
+    const calls = toolCallStore.get(fetchToolCalls)!;
+    toolCallStore.delete(fetchToolCalls);
+    return Response.json(calls);
+  }
+  if (fetchToolCalls) {
+    return Response.json([]);
+  }
 
   const { patientInfo, visitNotes } = await fetchPatientData(patientId ?? "demo");
+
+  const reqId = crypto.randomUUID();
+  const collectedToolCalls: Array<{ toolName: string; args: unknown; result: unknown }> = [];
 
   const result = streamText({
     model: openai("gpt-4o"),
@@ -22,6 +38,19 @@ export async function POST(req: Request) {
     messages,
     temperature: 0.3,
     stopWhen: stepCountIs(3),
+    onStepFinish: ({ toolCalls, toolResults }) => {
+      if (toolCalls && toolCalls.length > 0) {
+        for (let i = 0; i < toolCalls.length; i++) {
+          collectedToolCalls.push({
+            toolName: toolCalls[i].toolName,
+            args: toolCalls[i].input,
+            result: toolResults?.[i]?.output ?? null,
+          });
+        }
+        toolCallStore.set(reqId, collectedToolCalls);
+        setTimeout(() => toolCallStore.delete(reqId), 30000);
+      }
+    },
     tools: {
       drug_interaction_check: tool({
         description:
@@ -96,5 +125,7 @@ export async function POST(req: Request) {
     },
   });
 
-  return result.toTextStreamResponse();
+  const response = result.toTextStreamResponse();
+  response.headers.set("X-Request-Id", reqId);
+  return response;
 }

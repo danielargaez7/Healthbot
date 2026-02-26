@@ -2380,7 +2380,16 @@ export default function PatientPortal() {
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
+  const [expandedTools, setExpandedTools] = useState<Set<number>>(new Set());
   const chatEndRef = useRef<HTMLDivElement>(null);
+
+  const TOOL_DISPLAY_NAMES: Record<string, { label: string; icon: string }> = {
+    drug_interaction_check: { label: "Drug Interaction Check", icon: "" },
+    symptom_lookup: { label: "Symptom Analysis", icon: "" },
+    provider_search: { label: "Provider Search", icon: "" },
+    appointment_availability: { label: "Appointment Availability", icon: "" },
+    insurance_coverage_check: { label: "Insurance Coverage Check", icon: "" },
+  };
 
   /* Tool context — tracks recent tool activity so AI can synthesize across tools */
   const [toolContext, setToolContext] = useState<string[]>([]);
@@ -2577,6 +2586,7 @@ export default function PatientPortal() {
 
       if (!res.ok) throw new Error("API error");
 
+      const reqId = res.headers.get("X-Request-Id");
       setChatLoading(false);
       setChatMessages((m) => [...m, { role: "assistant" as const, content: "", time: "Now" }]);
 
@@ -2602,6 +2612,36 @@ export default function PatientPortal() {
         }
         // Auto-expand chat panel after first AI response
         if (!chatExpanded) setChatExpanded(true);
+
+        // Fetch tool calls that happened during this request
+        if (reqId) {
+          try {
+            const toolRes = await fetch("/api/chat", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ fetchToolCalls: reqId }),
+            });
+            if (toolRes.ok) {
+              const calls = await toolRes.json();
+              if (Array.isArray(calls) && calls.length > 0) {
+                setChatMessages((prev) => {
+                  const updated = [...prev];
+                  // Find the last assistant message
+                  let idx = updated.length - 1;
+                  for (let i = updated.length - 1; i >= 0; i--) {
+                    if (updated[i].role === "assistant" && updated[i].content) { idx = i; break; }
+                  }
+                  // Insert tool cards AFTER the assistant response
+                  const toolMsgs = calls.map((tc: { toolName: string; args: unknown; result: unknown }) => ({
+                    role: "tool" as any, toolName: tc.toolName, args: tc.args, result: tc.result, time: "Now",
+                  }));
+                  updated.splice(idx + 1, 0, ...toolMsgs);
+                  return updated;
+                });
+              }
+            }
+          } catch { /* non-critical */ }
+        }
       }
     } catch {
       setChatLoading(false);
@@ -3144,6 +3184,65 @@ export default function PatientPortal() {
                     </div>
                     <div style={{ background: "#ffffff", border: "1px solid #e5e7eb", borderRadius: "16px 16px 16px 4px", padding: "8px 14px" }}>
                       <p style={{ fontSize: 13, color: "#374151", margin: 0 }}>{msg.content}</p>
+                    </div>
+                  </div>
+                ) : (msg as any).role === "tool" ? (
+                  <div style={{ display: "flex", gap: 8, padding: "2px 0" }}>
+                    <div style={{ width: 24, minWidth: 24 }} />
+                    <div
+                      style={{
+                        background: "#f8fafc",
+                        border: "1px solid #e2e8f0",
+                        borderRadius: 8,
+                        padding: "6px 12px",
+                        maxWidth: "85%",
+                        fontSize: 12,
+                        cursor: "pointer",
+                      }}
+                      onClick={() => setExpandedTools((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(i)) { next.delete(i); } else { next.add(i); }
+                        return next;
+                      })}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#475569" strokeWidth="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" /></svg>
+                        <span style={{ fontWeight: 600, color: "#475569", fontSize: 12 }}>
+                          Tool Call Activated
+                        </span>
+                        <svg
+                          width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2"
+                          style={{ marginLeft: "auto", transform: expandedTools.has(i) ? "rotate(180deg)" : "rotate(0deg)", transition: "transform 0.2s" }}
+                        >
+                          <polyline points="6 9 12 15 18 9" />
+                        </svg>
+                      </div>
+                      {expandedTools.has(i) && (
+                        <div style={{ marginTop: 8, fontSize: 11, fontFamily: "'JetBrains Mono', monospace", color: "#64748b", lineHeight: 1.5 }}>
+                          <div style={{ marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
+                            <span style={{ fontWeight: 600, color: "#334155" }}>
+                              {(TOOL_DISPLAY_NAMES[(msg as any).toolName] || { label: (msg as any).toolName }).label}
+                            </span>
+                            {(msg as any).result ? (
+                              <span style={{ color: "#22c55e", fontSize: 11, fontWeight: 600 }}>Complete</span>
+                            ) : (
+                              <span style={{ color: "#3b82f6", fontSize: 11 }}>Running...</span>
+                            )}
+                          </div>
+                          <div style={{ marginBottom: 4 }}>
+                            <span style={{ color: "#94a3b8" }}>Input: </span>
+                            {JSON.stringify((msg as any).args, null, 2)}
+                          </div>
+                          {(msg as any).result && (
+                            <div style={{ maxHeight: 200, overflowY: "auto" }}>
+                              <span style={{ color: "#94a3b8" }}>Output: </span>
+                              <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                                {JSON.stringify((msg as any).result, null, 2)}
+                              </pre>
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                 ) : (msg as any).data ? (
