@@ -157,6 +157,7 @@ Connects to OpenEMR (or any FHIR-compliant EHR) via OAuth2 client_credentials:
 | Vercel AI SDK | v6 | `streamText`, `tool()`, `stepCountIs()` |
 | OpenAI SDK | v3 | GPT-4o model provider |
 | Zod | v4 | Tool input schema validation |
+| LangSmith | v0.5 | Observability, tracing & user feedback |
 | Vitest | v4 | Test framework (69 evals) |
 | TypeScript | v5 | Type safety |
 | Tailwind CSS | v3.4 | Styling |
