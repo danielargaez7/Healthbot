@@ -2376,12 +2376,15 @@ export default function PatientPortal() {
   /* Chat state */
   const [chatOpen, setChatOpen] = useState(false);
   const [chatExpanded, setChatExpanded] = useState(false);
-  const [chatMessages, setChatMessages] = useState<Array<{ role: string; content?: string; data?: any; time: string }>>([
+  const [chatMessages, setChatMessages] = useState<Array<{ role: string; content?: string; data?: any; time: string; runId?: string }>>([
     { role: "system", content: "Hello! I'm MedAssist AI with full access to Gord Sims' medical records — 15 visit notes, labs, medications, imaging, and more. Ask me anything about this patient.", time: "Now" },
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [expandedTools, setExpandedTools] = useState<Set<number>>(new Set());
+  const [feedback, setFeedback] = useState<Record<string, "up" | "down">>({});
+  const [correctionOpen, setCorrectionOpen] = useState<string | null>(null);
+  const [correctionText, setCorrectionText] = useState("");
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   const TOOL_DISPLAY_NAMES: Record<string, { label: string; icon: string }> = {
@@ -2589,7 +2592,7 @@ export default function PatientPortal() {
 
       const reqId = res.headers.get("X-Request-Id");
       setChatLoading(false);
-      setChatMessages((m) => [...m, { role: "assistant" as const, content: "", time: "Now" }]);
+      setChatMessages((m) => [...m, { role: "assistant" as const, content: "", time: "Now", runId: reqId || undefined }]);
 
       const reader = res.body?.getReader();
       const decoder = new TextDecoder();
@@ -2666,6 +2669,39 @@ export default function PatientPortal() {
         { role: "assistant" as const, content: "Sorry, I couldn't process that request. Please check that your OpenAI API key is configured in .env.local and try again.", time: "Now" },
       ]);
     }
+  };
+
+  const handleFeedback = async (runId: string, score: "up" | "down") => {
+    setFeedback((prev) => ({ ...prev, [runId]: score }));
+    if (score === "down") {
+      setCorrectionOpen(runId);
+    } else {
+      setCorrectionOpen(null);
+      try {
+        await fetch("/api/feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ runId, score: 1 }),
+        });
+      } catch { /* non-critical */ }
+    }
+  };
+
+  const submitCorrection = async (runId: string) => {
+    setCorrectionOpen(null);
+    try {
+      await fetch("/api/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          runId,
+          score: 0,
+          comment: "User indicated response was unhelpful",
+          correction: correctionText || undefined,
+        }),
+      });
+    } catch { /* non-critical */ }
+    setCorrectionText("");
   };
 
   const quickActions = [
@@ -3275,8 +3311,101 @@ export default function PatientPortal() {
                     <div style={{ width: 24, height: 24, minWidth: 24, borderRadius: "50%", background: "#f1f5f9", border: "1px solid #e2e8f0", display: "flex", alignItems: "center", justifyContent: "center", marginTop: 2 }}>
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" strokeWidth="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2" /></svg>
                     </div>
-                    <div style={{ background: "#ffffff", border: "1px solid #e5e7eb", borderRadius: "16px 16px 16px 4px", padding: "10px 14px", maxWidth: "85%" }}>
-                      {renderAIText(msg.content || "")}
+                    <div style={{ maxWidth: "85%" }}>
+                      <div style={{ background: "#ffffff", border: "1px solid #e5e7eb", borderRadius: "16px 16px 16px 4px", padding: "10px 14px" }}>
+                        {renderAIText(msg.content || "")}
+                      </div>
+                      {msg.runId && msg.content && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 2, marginTop: 4, marginLeft: 4 }}>
+                          <button
+                            onClick={() => handleFeedback(msg.runId!, "up")}
+                            title="Helpful"
+                            style={{
+                              background: "none",
+                              border: "none",
+                              cursor: "pointer",
+                              padding: "2px 4px",
+                              borderRadius: 4,
+                              color: feedback[msg.runId!] === "up" ? "#22c55e" : "#94a3b8",
+                              transition: "color 0.15s",
+                              display: "flex",
+                              alignItems: "center",
+                            }}
+                          >
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill={feedback[msg.runId!] === "up" ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3" /></svg>
+                          </button>
+                          <button
+                            onClick={() => handleFeedback(msg.runId!, "down")}
+                            title="Not helpful"
+                            style={{
+                              background: "none",
+                              border: "none",
+                              cursor: "pointer",
+                              padding: "2px 4px",
+                              borderRadius: 4,
+                              color: feedback[msg.runId!] === "down" ? "#ef4444" : "#94a3b8",
+                              transition: "color 0.15s",
+                              display: "flex",
+                              alignItems: "center",
+                            }}
+                          >
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill={feedback[msg.runId!] === "down" ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17" /></svg>
+                          </button>
+                          {feedback[msg.runId!] && (
+                            <span style={{ fontSize: 10, color: "#94a3b8", marginLeft: 2 }}>
+                              {feedback[msg.runId!] === "up" ? "Thanks!" : ""}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {correctionOpen === msg.runId && (
+                        <div style={{ marginTop: 6, marginLeft: 4, display: "flex", gap: 6, alignItems: "flex-end" }}>
+                          <input
+                            value={correctionText}
+                            onChange={(e) => setCorrectionText(e.target.value)}
+                            onKeyDown={(e) => e.key === "Enter" && msg.runId && submitCorrection(msg.runId)}
+                            placeholder="What would be a better response? (optional)"
+                            style={{
+                              flex: 1,
+                              fontSize: 11,
+                              padding: "5px 8px",
+                              border: "1px solid #e2e8f0",
+                              borderRadius: 6,
+                              outline: "none",
+                              color: "#374151",
+                              background: "#fff",
+                            }}
+                          />
+                          <button
+                            onClick={() => msg.runId && submitCorrection(msg.runId)}
+                            style={{
+                              fontSize: 10,
+                              padding: "5px 10px",
+                              background: "#f1f5f9",
+                              border: "1px solid #e2e8f0",
+                              borderRadius: 6,
+                              cursor: "pointer",
+                              color: "#475569",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            Submit
+                          </button>
+                          <button
+                            onClick={() => { setCorrectionOpen(null); setCorrectionText(""); }}
+                            style={{
+                              fontSize: 10,
+                              padding: "5px 8px",
+                              background: "none",
+                              border: "none",
+                              cursor: "pointer",
+                              color: "#94a3b8",
+                            }}
+                          >
+                            Skip
+                          </button>
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}

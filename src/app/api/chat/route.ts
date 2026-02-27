@@ -4,6 +4,7 @@ import { z } from "zod";
 import { buildSystemPrompt } from "@/lib/system-prompt";
 import { fetchPatientData } from "@/lib/fhir/fetch-patient";
 import { checkInput, REFUSAL_MESSAGE } from "@/lib/guardrails";
+import { createRun, updateRun } from "@/lib/langsmith";
 import {
   drugInteractionCheck,
   symptomLookup,
@@ -42,13 +43,25 @@ export async function POST(req: Request) {
   }
 
   const { patientInfo, visitNotes } = await fetchPatientData(patientId ?? "demo");
+  const systemPrompt = buildSystemPrompt(patientInfo, visitNotes);
 
   const reqId = crypto.randomUUID();
   const collectedToolCalls: Array<{ toolName: string; args: unknown; result: unknown }> = [];
 
+  // Trace to LangSmith (non-blocking)
+  const userContent = lastMessage?.content || "";
+  createRun({
+    runId: reqId,
+    userMessage: userContent,
+    systemPrompt,
+    patientId: patientId ?? "demo",
+  }).catch(() => {});
+
+  let fullOutput = "";
+
   const result = streamText({
     model: openai("gpt-4o"),
-    system: buildSystemPrompt(patientInfo, visitNotes),
+    system: systemPrompt,
     messages,
     temperature: 0.3,
     stopWhen: stepCountIs(3),
@@ -64,6 +77,15 @@ export async function POST(req: Request) {
         toolCallStore.set(reqId, collectedToolCalls);
         setTimeout(() => toolCallStore.delete(reqId), 30000);
       }
+    },
+    onFinish: ({ text }) => {
+      fullOutput = text;
+      // Update LangSmith run with final output (non-blocking)
+      updateRun({
+        runId: reqId,
+        output: fullOutput,
+        toolCalls: collectedToolCalls,
+      }).catch(() => {});
     },
     tools: {
       drug_interaction_check: tool({
