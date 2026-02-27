@@ -2611,6 +2611,21 @@ export default function PatientPortal() {
             return updated;
           });
         }
+        // If stream completed with no text, show fallback refusal
+        if (!fullText.trim()) {
+          setChatMessages((prev) => {
+            const updated = [...prev];
+            const last = updated[updated.length - 1];
+            if (last && last.role === "assistant" && !last.content) {
+              updated[updated.length - 1] = {
+                ...last,
+                content: "I'm MedAssist AI, a clinical decision support tool. I can only assist with healthcare-related questions about this patient's care.",
+              };
+            }
+            return updated;
+          });
+        }
+
         // Auto-expand chat panel after first AI response
         if (!chatExpanded) setChatExpanded(true);
 

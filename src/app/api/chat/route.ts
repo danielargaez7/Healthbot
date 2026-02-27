@@ -3,6 +3,7 @@ import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
 import { buildSystemPrompt } from "@/lib/system-prompt";
 import { fetchPatientData } from "@/lib/fhir/fetch-patient";
+import { checkInput, REFUSAL_MESSAGE } from "@/lib/guardrails";
 import {
   drugInteractionCheck,
   symptomLookup,
@@ -25,6 +26,19 @@ export async function POST(req: Request) {
   }
   if (fetchToolCalls) {
     return Response.json([]);
+  }
+
+  // --- Input guardrail: block off-topic/adversarial messages before hitting the LLM ---
+  const lastMessage = messages?.[messages.length - 1];
+  if (lastMessage?.role === "user" && lastMessage?.content) {
+    const { allowed, reason } = checkInput(lastMessage.content);
+    if (!allowed) {
+      // Return refusal as a plain text stream (no LLM call needed)
+      const refusal = reason || REFUSAL_MESSAGE;
+      return new Response(refusal, {
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
+    }
   }
 
   const { patientInfo, visitNotes } = await fetchPatientData(patientId ?? "demo");
