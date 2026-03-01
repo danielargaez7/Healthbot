@@ -15,6 +15,9 @@ import {
   providerSearch,
   appointmentAvailability,
   insuranceCoverageCheck,
+  dosingValidation,
+  labInterpretation,
+  medicationReconciliation,
 } from "@/lib/clinical-tools";
 import {
   factCheck,
@@ -669,5 +672,151 @@ describe("Verification Layer", () => {
     expect(result.verification.passed).toBe(false);
     expect(result.verification.requires_human_review).toBe(true);
     expect(result.verification.errors.length).toBeGreaterThan(0);
+  });
+});
+
+/* ══════════════════════════════════════════════════
+   NEW CLINICAL TOOL FUNCTION TESTS
+   ══════════════════════════════════════════════════ */
+
+/* ────────────────────────────────────────────────
+   Test 16: dosing_validation
+   ──────────────────────────────────────────────── */
+describe("dosing_validation", () => {
+  it("should flag Aspirin 325mg as above recommended dose for cardioprotection", () => {
+    const result = dosingValidation("Aspirin", "325mg", "cardioprotective");
+    expect(result.data.medication).toBe("Aspirin");
+    expect(result.data.is_within_range).toBe(false);
+    expect(result.data.recommendation).toContain("exceeds");
+    expect(result.data.recommendation).toContain("81mg");
+  });
+
+  it("should accept Lisinopril 10mg as within range but warn about K+", () => {
+    const result = dosingValidation("Lisinopril", "10mg", "hypertension");
+    expect(result.data.is_within_range).toBe(true);
+    expect(result.data.warnings.some((w) => w.includes("K+") || w.includes("potassium"))).toBe(true);
+  });
+
+  it("should accept Acetaminophen 500mg and include max daily dose info", () => {
+    const result = dosingValidation("Acetaminophen", "500mg", "analgesic");
+    expect(result.data.is_within_range).toBe(true);
+    expect(result.data.max_daily_dose).toBe("3000mg");
+  });
+
+  it("should fail fact_check for unknown medication", () => {
+    const result = dosingValidation("FakeDrugXYZ", "100mg");
+    expect(result.verification.passed).toBe(false);
+    expect(result.data.recommendation).toContain("not found");
+  });
+
+  it("should return valid VerifiedToolResult structure", () => {
+    const result = dosingValidation("Aspirin", "81mg", "cardioprotective");
+    expect(result).toHaveProperty("status");
+    expect(result).toHaveProperty("data");
+    expect(result).toHaveProperty("verification");
+    expect(result.verification.verification_types).toContain("fact_check");
+    expect(result.verification.verification_types).toContain("confidence_scoring");
+    expect(result.verification.confidence).toBeGreaterThan(0);
+    expect(result.verification.confidence).toBeLessThanOrEqual(1);
+  });
+});
+
+/* ────────────────────────────────────────────────
+   Test 17: lab_interpretation
+   ──────────────────────────────────────────────── */
+describe("lab_interpretation", () => {
+  it("should analyze all labs when no specific labs requested", () => {
+    const result = labInterpretation();
+    expect(result.data.labs_analyzed.length).toBeGreaterThanOrEqual(4);
+    const labNames = result.data.labs_analyzed.map((l) => l.lab);
+    expect(labNames).toContain("Potassium");
+    expect(labNames).toContain("Creatinine");
+  });
+
+  it("should flag K+ as critical with worsening trend", () => {
+    const result = labInterpretation(["K"]);
+    const kLab = result.data.labs_analyzed.find((l) => l.lab === "Potassium");
+    expect(kLab).toBeDefined();
+    expect(kLab!.status).toBe("critical");
+    expect(kLab!.trend).toBe("worsening");
+    expect(kLab!.latest_value).toBe(5.8);
+  });
+
+  it("should show CRP with improving trend (pericarditis resolution)", () => {
+    const result = labInterpretation(["CRP"]);
+    const crpLab = result.data.labs_analyzed.find((l) => l.lab === "C-Reactive Protein");
+    expect(crpLab).toBeDefined();
+    expect(crpLab!.trend).toBe("improving");
+    expect(crpLab!.latest_value).toBe(3.2);
+  });
+
+  it("should correlate K+ elevation with Lisinopril", () => {
+    const result = labInterpretation(["K"]);
+    expect(result.data.medication_correlations.some((c) => c.includes("Lisinopril"))).toBe(true);
+    expect(result.data.medication_correlations.some((c) => c.includes("ACE inhibitor"))).toBe(true);
+  });
+
+  it("should escalate critical alerts for human review", () => {
+    const result = labInterpretation();
+    expect(result.data.critical_alerts.length).toBeGreaterThan(0);
+    expect(result.verification.requires_human_review).toBe(true);
+    expect(result.verification.verification_types).toContain("human_in_the_loop");
+    expect(result.verification.verification_types).toContain("domain_constraints");
+  });
+});
+
+/* ────────────────────────────────────────────────
+   Test 18: medication_reconciliation
+   ──────────────────────────────────────────────── */
+describe("medication_reconciliation", () => {
+  it("should detect Colchicine as discontinued in EHR", () => {
+    const result = medicationReconciliation();
+    const colchicineDisc = result.data.discrepancies.find(
+      (d) => d.medication.includes("Colchicine") && d.type === "still_listed_discontinued"
+    );
+    expect(colchicineDisc).toBeDefined();
+  });
+
+  it("should identify statin therapy gap", () => {
+    const result = medicationReconciliation();
+    const statinGap = result.data.therapy_gaps.find((g) => g.therapy.includes("Statin"));
+    expect(statinGap).toBeDefined();
+    expect(statinGap!.indication).toContain("LDL");
+    expect(statinGap!.recommendation).toContain("Atorvastatin");
+  });
+
+  it("should flag Doxycycline duration alert", () => {
+    const result = medicationReconciliation();
+    const doxyAlert = result.data.duration_alerts.find((d) => d.medication.includes("Doxycycline"));
+    expect(doxyAlert).toBeDefined();
+    expect(doxyAlert!.prescribed_duration).toBe("10 days");
+    expect(doxyAlert!.elapsed_days).toBeGreaterThan(0);
+  });
+
+  it("should detect patient-reported supplements missing from EHR", () => {
+    const result = medicationReconciliation();
+    const missingFromEhr = result.data.discrepancies.filter((d) => d.type === "missing_from_ehr");
+    expect(missingFromEhr.length).toBeGreaterThan(0);
+    const supplementNames = missingFromEhr.map((d) => d.medication);
+    expect(supplementNames.some((n) => n.includes("Vitamin D3") || n.includes("Fish Oil"))).toBe(true);
+  });
+
+  it("should recommend ACE→ARB switch due to elevated K+", () => {
+    const result = medicationReconciliation();
+    const arbSwitch = result.data.therapy_gaps.find((g) => g.therapy.includes("ARB"));
+    expect(arbSwitch).toBeDefined();
+    expect(arbSwitch!.recommendation).toContain("Losartan");
+    expect(arbSwitch!.recommendation).toContain("Discontinue Lisinopril");
+  });
+
+  it("should return valid VerifiedToolResult with discrepancies flagged", () => {
+    const result = medicationReconciliation();
+    expect(result).toHaveProperty("status");
+    expect(result).toHaveProperty("data");
+    expect(result).toHaveProperty("verification");
+    expect(result.data.chart_medications.length).toBeGreaterThan(0);
+    expect(result.data.ehr_medications.length).toBeGreaterThan(0);
+    expect(result.data.summary).toContain("requiring attention");
+    expect(result.verification.verification_types).toContain("fact_check");
   });
 });

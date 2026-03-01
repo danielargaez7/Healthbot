@@ -6,6 +6,8 @@ A clinician workstation powered by GPT-4o with 5 domain-specific healthcare tool
 
 **Live Demo**: [healthbot-liard.vercel.app](https://healthbot-liard.vercel.app)
 
+**Open Source Eval Dataset**: [medassist-eval on npm](https://www.npmjs.com/package/medassist-eval) — 85 clinical AI test cases published as a public package for healthcare agent benchmarking
+
 ---
 
 ## Quick Start

@@ -603,3 +603,156 @@ export const computeBodySystemScores = (): BodySystemScore[] => [
     rationale: "Low depression and anxiety scores. Moderate work stress. Sleep 6-7 hours. No treatment needed.",
   },
 ];
+
+/* ═══════════════════════════════════════════════════
+   DOSING GUIDELINES DATABASE
+   Standard dose ranges, max daily doses, and
+   indication-specific recommendations
+   ═══════════════════════════════════════════════════ */
+
+export interface DosingGuideline {
+  standardDoses: string[];
+  maxDailyDose: string;
+  indications: Record<string, { recommendedDose: string; notes: string }>;
+  renalAdjustment: { required: boolean; note: string };
+  ageConsiderations: string;
+  warnings: string[];
+}
+
+export const DOSING_GUIDELINES: Record<string, DosingGuideline> = {
+  Aspirin: {
+    standardDoses: ["81mg", "325mg", "500mg", "650mg"],
+    maxDailyDose: "4000mg",
+    indications: {
+      cardioprotective: { recommendedDose: "81mg", notes: "ACC/AHA recommends low-dose aspirin (81mg) for cardiovascular prevention. 325mg is anti-inflammatory dose, not standard for cardioprotection." },
+      antiInflammatory: { recommendedDose: "325-650mg", notes: "Higher doses used for acute inflammation (e.g., pericarditis). Typically short-term." },
+      analgesic: { recommendedDose: "325-650mg", notes: "Standard analgesic dosing. Use lowest effective dose." },
+    },
+    renalAdjustment: { required: false, note: "Avoid in severe renal impairment (GFR <10)." },
+    ageConsiderations: ">70: Increased bleeding risk. Reassess benefit vs. risk of aspirin therapy.",
+    warnings: ["GI bleeding risk increases with dose", "Avoid with anticoagulants if possible", "Monitor for tinnitus at high doses"],
+  },
+  Lisinopril: {
+    standardDoses: ["5mg", "10mg", "20mg", "40mg"],
+    maxDailyDose: "80mg",
+    indications: {
+      hypertension: { recommendedDose: "10-40mg", notes: "Start 10mg daily, titrate to BP goal (<130/80). Usual maintenance 20-40mg." },
+      heartFailure: { recommendedDose: "5-40mg", notes: "Start low (2.5-5mg), titrate up every 2 weeks as tolerated." },
+    },
+    renalAdjustment: { required: true, note: "Reduce starting dose to 5mg if GFR <30. Monitor K+ and creatinine closely." },
+    ageConsiderations: ">65: Start with lower dose (5mg). Greater risk of hyperkalemia and hypotension.",
+    warnings: ["Monitor potassium — ACE inhibitors increase K+ retention", "Monitor creatinine at baseline and 1-2 weeks after initiation", "Contraindicated in pregnancy", "Discontinue if angioedema occurs"],
+  },
+  Doxycycline: {
+    standardDoses: ["50mg", "100mg"],
+    maxDailyDose: "200mg",
+    indications: {
+      infection: { recommendedDose: "100mg BID", notes: "Standard dose for most infections. Typical course 7-14 days." },
+      acne: { recommendedDose: "50-100mg daily", notes: "Lower dose for chronic acne management." },
+    },
+    renalAdjustment: { required: false, note: "No dose adjustment needed — primarily hepatic elimination." },
+    ageConsiderations: "Avoid in children <8 years (tooth discoloration). Safe in adults of all ages.",
+    warnings: ["Take with full glass of water, remain upright 30 min", "Photosensitivity — use sunscreen", "Avoid dairy/antacids within 2 hours"],
+  },
+  Acetaminophen: {
+    standardDoses: ["325mg", "500mg", "650mg", "1000mg"],
+    maxDailyDose: "3000mg",
+    indications: {
+      analgesic: { recommendedDose: "500-1000mg", notes: "Every 4-6 hours as needed. Do not exceed 3g/day (reduced from 4g)." },
+      antipyretic: { recommendedDose: "500-1000mg", notes: "Every 4-6 hours for fever reduction." },
+    },
+    renalAdjustment: { required: false, note: "Use with caution in severe renal impairment. Extend dosing interval." },
+    ageConsiderations: ">65: Maximum 2g/day recommended. Higher hepatotoxicity risk.",
+    warnings: ["Hepatotoxicity risk above 3g/day", "Check all medications for hidden acetaminophen (combination products)", "Avoid with alcohol use (>3 drinks/day)"],
+  },
+  Losartan: {
+    standardDoses: ["25mg", "50mg", "100mg"],
+    maxDailyDose: "100mg",
+    indications: {
+      hypertension: { recommendedDose: "50-100mg", notes: "Start 50mg daily. May titrate to 100mg. Alternative to ACE inhibitors when K+ elevated or ACE cough." },
+    },
+    renalAdjustment: { required: true, note: "Start 25mg if hepatic impairment or volume depletion. Monitor K+." },
+    ageConsiderations: ">75: Start 25mg daily. Increased hypotension risk.",
+    warnings: ["Monitor potassium (less K+ elevation than ACE inhibitors)", "Contraindicated in pregnancy", "Monitor renal function"],
+  },
+  Metformin: {
+    standardDoses: ["500mg", "850mg", "1000mg"],
+    maxDailyDose: "2550mg",
+    indications: {
+      diabetes: { recommendedDose: "500-1000mg BID", notes: "Start 500mg daily with meals, titrate weekly. Target 2000mg/day in divided doses." },
+    },
+    renalAdjustment: { required: true, note: "Contraindicated if GFR <30. Reduce dose if GFR 30-45." },
+    ageConsiderations: ">80: Check GFR before initiating. Increased lactic acidosis risk.",
+    warnings: ["Take with meals to reduce GI side effects", "Hold before contrast dye procedures", "Lactic acidosis risk with renal impairment"],
+  },
+  Atorvastatin: {
+    standardDoses: ["10mg", "20mg", "40mg", "80mg"],
+    maxDailyDose: "80mg",
+    indications: {
+      dyslipidemia: { recommendedDose: "10-80mg", notes: "Moderate-intensity: 10-20mg. High-intensity: 40-80mg. Choice depends on ASCVD risk." },
+      cardiovascularPrevention: { recommendedDose: "40-80mg", notes: "High-intensity statin for patients with established ASCVD or high 10-year risk (>20%)." },
+    },
+    renalAdjustment: { required: false, note: "No dose adjustment needed for renal impairment." },
+    ageConsiderations: ">75: Moderate-intensity (10-20mg) preferred. Discuss benefit vs. risk.",
+    warnings: ["Monitor LFTs at baseline", "Report unexplained muscle pain (rhabdomyolysis risk)", "Avoid grapefruit juice in large quantities"],
+  },
+  Amlodipine: {
+    standardDoses: ["2.5mg", "5mg", "10mg"],
+    maxDailyDose: "10mg",
+    indications: {
+      hypertension: { recommendedDose: "5-10mg", notes: "Start 5mg daily. Effective as monotherapy or combination. Long half-life allows once-daily dosing." },
+    },
+    renalAdjustment: { required: false, note: "No dose adjustment needed." },
+    ageConsiderations: ">65: Start 2.5mg. Increased sensitivity to vasodilatory effects.",
+    warnings: ["Peripheral edema is common (dose-related)", "Avoid abrupt discontinuation"],
+  },
+  Omeprazole: {
+    standardDoses: ["20mg", "40mg"],
+    maxDailyDose: "40mg",
+    indications: {
+      gerd: { recommendedDose: "20mg", notes: "Once daily before breakfast. 4-8 week course for healing, then reassess." },
+      ulcer: { recommendedDose: "20-40mg", notes: "40mg for active ulcer healing. Step down after 8 weeks." },
+    },
+    renalAdjustment: { required: false, note: "No dose adjustment needed." },
+    ageConsiderations: ">65: Long-term use increases fracture risk and Mg deficiency. Reassess annually.",
+    warnings: ["Long-term use: fracture risk, B12 deficiency, hypomagnesemia", "Increased C. difficile risk", "Taper when discontinuing after long-term use"],
+  },
+  Prednisone: {
+    standardDoses: ["5mg", "10mg", "20mg", "40mg", "60mg"],
+    maxDailyDose: "80mg",
+    indications: {
+      antiInflammatory: { recommendedDose: "5-60mg", notes: "Dose depends on condition severity. Taper gradually after >7 days of use." },
+    },
+    renalAdjustment: { required: false, note: "No dose adjustment needed." },
+    ageConsiderations: ">65: Increased risk of osteoporosis, glucose elevation, and infection. Use lowest effective dose.",
+    warnings: ["Taper gradually — do not stop abruptly", "Monitor blood glucose", "Increased infection risk", "GI protection if combined with NSAIDs"],
+  },
+};
+
+/* ═══════════════════════════════════════════════════
+   EHR MEDICATION LIST
+   Simulates what the EHR system has on file — may
+   differ from patient-reported medications to create
+   realistic reconciliation discrepancies
+   ═══════════════════════════════════════════════════ */
+
+export interface EHRMedication {
+  name: string;
+  dose: string;
+  freq: string;
+  status: "active" | "discontinued" | "pending";
+  source: string;
+  prescriber: string;
+  startDate: string;
+  endDate: string | null;
+}
+
+export const EHR_MEDICATION_LIST: EHRMedication[] = [
+  { name: "Enteric Coated Aspirin", dose: "325mg", freq: "Daily", status: "active", source: "EHR", prescriber: "Dr. Patel", startDate: "2024-03-12", endDate: null },
+  { name: "Lisinopril", dose: "10mg", freq: "Daily", status: "active", source: "EHR", prescriber: "Dr. Patel", startDate: "2024-03-12", endDate: null },
+  { name: "Doxycycline", dose: "100mg", freq: "BID", status: "active", source: "EHR", prescriber: "Dr. Patel", startDate: "2025-12-03", endDate: null },
+  { name: "Tylenol (Acetaminophen)", dose: "500mg", freq: "PRN", status: "active", source: "EHR", prescriber: "Dr. Patel", startDate: "2025-03-10", endDate: null },
+  { name: "Colchicine", dose: "0.5mg", freq: "BID", status: "discontinued", source: "EHR", prescriber: "Dr. Patel", startDate: "2024-08-06", endDate: "2024-11-05" },
+  // Note: Vitamin D3 and Fish Oil are patient-reported supplements — NOT in EHR
+  // Note: Losartan 50mg is planned (per visit note vn-15) but not yet prescribed
+];

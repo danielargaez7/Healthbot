@@ -1,6 +1,6 @@
 /* ═══════════════════════════════════════════════
    MedAssist Clinical Tools — callable functions
-   5 domain-specific healthcare tools
+   8 domain-specific healthcare tools
    Each tool returns VerifiedToolResult with verification layer
    ═══════════════════════════════════════════════ */
 
@@ -11,6 +11,11 @@ import {
   INITIAL_APPOINTMENTS,
   TIME_SLOTS,
   COMMON_MEDICATIONS,
+  DOSING_GUIDELINES,
+  EHR_MEDICATION_LIST,
+  LAB_TRENDS,
+  REFERENCE_RANGES,
+  MEDICATION_TIMELINE,
   formatTime12,
 } from "./patient-data";
 
@@ -464,6 +469,7 @@ const PROCEDURE_DB: Record<string, { name: string; covered: boolean; coverage_le
 };
 
 const ALL_PROCEDURE_CODES = Object.keys(PROCEDURE_DB);
+const ALL_KNOWN_DRUGS_FOR_DOSING = Object.keys(DOSING_GUIDELINES);
 
 export function insuranceCoverageCheck(procedureCode: string, planId?: string): VerifiedToolResult<InsuranceCoverageResult> {
   const patientInsurance = PATIENT_INFO.insurance;
@@ -523,6 +529,550 @@ export function insuranceCoverageCheck(procedureCode: string, planId?: string): 
       confidence: codeFound ? 0.92 : 0.2,
       severity: coverage.prior_auth_required ? "moderate" : "low",
       stakes: coverage.prior_auth_required || !codeFound ? "high" : "medium",
+    },
+  });
+}
+
+/* ─────────────────────────────────────────────────
+   Tool 6: dosing_validation
+   Verification: fact_check, confidence, domain_constraints, human_in_the_loop
+   ───────────────────────────────────────────────── */
+
+interface DosingValidationResult {
+  medication: string;
+  current_dose: string;
+  indication: string;
+  standard_dose_range: string[];
+  is_within_range: boolean;
+  max_daily_dose: string;
+  recommendation: string;
+  warnings: string[];
+  patient_factors: string[];
+}
+
+function parseDoseMg(dose: string): number | null {
+  const match = dose.replace(/,/g, "").match(/([\d.]+)\s*(mg|g|iu|mcg)/i);
+  if (!match) return null;
+  const value = parseFloat(match[1]);
+  const unit = match[2].toLowerCase();
+  if (unit === "g") return value * 1000;
+  if (unit === "mcg") return value / 1000;
+  return value;
+}
+
+export function dosingValidation(medication: string, dose: string, indication?: string): VerifiedToolResult<DosingValidationResult> {
+  const normalize = (name: string) => name.toLowerCase().replace(/[^a-z]/g, "");
+  const normalizedMed = normalize(medication);
+
+  // Find guideline by normalized name match
+  const guidelineKey = Object.keys(DOSING_GUIDELINES).find(
+    (k) => normalize(k) === normalizedMed || normalizedMed.includes(normalize(k)) || normalize(k).includes(normalizedMed)
+  );
+  const guideline = guidelineKey ? DOSING_GUIDELINES[guidelineKey] : null;
+
+  if (!guideline) {
+    const data: DosingValidationResult = {
+      medication,
+      current_dose: dose,
+      indication: indication || "not specified",
+      standard_dose_range: [],
+      is_within_range: false,
+      max_daily_dose: "Unknown",
+      recommendation: `Medication "${medication}" not found in dosing guidelines database. Manual review required.`,
+      warnings: [`No dosing guidelines available for ${medication}`],
+      patient_factors: [],
+    };
+
+    return verify(data, {
+      factCheck: {
+        items: [medication],
+        knownDatabase: ALL_KNOWN_DRUGS_FOR_DOSING,
+        domain: "Pharmacology",
+        sourceName: "Clinical Dosing Guidelines",
+      },
+      confidenceInput: { dataCompleteness: 0.1, sourceReliability: 0.9, matchQuality: 0.0 },
+      humanReviewInput: { confidence: 0.1, severity: "moderate", stakes: "high" },
+    });
+  }
+
+  // Determine indication
+  const indicationKeys = Object.keys(guideline.indications);
+  const resolvedIndication = indication
+    ? indicationKeys.find((k) => normalize(k).includes(normalize(indication)) || normalize(indication).includes(normalize(k))) || indicationKeys[0]
+    : indicationKeys[0];
+  const indicationInfo = guideline.indications[resolvedIndication];
+
+  // Parse current dose and check range
+  const currentDoseMg = parseDoseMg(dose);
+  const standardDoses = guideline.standardDoses;
+
+  // Check indication-specific dose
+  const recommendedDoseMgs = indicationInfo.recommendedDose.split("-").map((s) => parseDoseMg(s.trim() + (s.trim().match(/\d$/) ? "mg" : ""))).filter((v): v is number => v !== null);
+  const indicationMin = recommendedDoseMgs.length > 0 ? Math.min(...recommendedDoseMgs) : null;
+  const indicationMax = recommendedDoseMgs.length > 0 ? Math.max(...recommendedDoseMgs) : null;
+  const isWithinIndicationRange = currentDoseMg !== null && indicationMin !== null && indicationMax !== null &&
+    currentDoseMg >= indicationMin && currentDoseMg <= indicationMax;
+
+  // Build warnings
+  const warnings: string[] = [...guideline.warnings];
+  const patientFactors: string[] = [];
+
+  // Patient-specific checks
+  const patientAge = 59;
+  if (patientAge >= 65 && guideline.ageConsiderations) {
+    patientFactors.push(guideline.ageConsiderations);
+  }
+
+  // Check K+ for ACE inhibitors / ARBs
+  const latestK = LAB_TRENDS.filter((l) => l.K !== null).pop()?.K;
+  if (latestK && latestK > 5.0 && (normalize(medication).includes("lisinopril") || normalize(medication).includes("losartan"))) {
+    warnings.push(`ALERT: Patient K+ is ${latestK} mEq/L (critically elevated). ACE inhibitors/ARBs increase K+ retention. Consider dose reduction or switching medication class.`);
+    patientFactors.push(`Current K+: ${latestK} mEq/L — above normal range (3.5–5.0)`);
+  }
+
+  if (guideline.renalAdjustment.required) {
+    patientFactors.push(`Renal adjustment: ${guideline.renalAdjustment.note}`);
+  }
+
+  // Build recommendation
+  let recommendation: string;
+  if (!isWithinIndicationRange && currentDoseMg !== null && indicationMin !== null) {
+    if (currentDoseMg > indicationMax!) {
+      recommendation = `Current dose ${dose} exceeds recommended ${indicationInfo.recommendedDose} for ${resolvedIndication}. ${indicationInfo.notes}`;
+    } else {
+      recommendation = `Current dose ${dose} is below typical ${indicationInfo.recommendedDose} for ${resolvedIndication}. ${indicationInfo.notes}`;
+    }
+  } else {
+    recommendation = `Dose ${dose} is within recommended range for ${resolvedIndication}. ${indicationInfo.notes}`;
+  }
+
+  const data: DosingValidationResult = {
+    medication,
+    current_dose: dose,
+    indication: resolvedIndication,
+    standard_dose_range: standardDoses,
+    is_within_range: isWithinIndicationRange,
+    max_daily_dose: guideline.maxDailyDose,
+    recommendation,
+    warnings,
+    patient_factors: patientFactors,
+  };
+
+  const hasCriticalWarning = warnings.some((w) => w.includes("ALERT") || w.includes("critically"));
+  const doseOutOfRange = !isWithinIndicationRange;
+
+  return verify(data, {
+    factCheck: {
+      items: [medication],
+      knownDatabase: ALL_KNOWN_DRUGS_FOR_DOSING,
+      domain: "Pharmacology",
+      sourceName: "Clinical Dosing Guidelines",
+    },
+    confidenceInput: {
+      dataCompleteness: 0.90,
+      sourceReliability: 0.92,
+      matchQuality: 1.0,
+    },
+    domainConstraints: {
+      outOfRangeValues: doseOutOfRange ? [`Dose ${dose} outside recommended range for ${resolvedIndication}`] : undefined,
+    },
+    humanReviewInput: {
+      confidence: 0.88,
+      severity: hasCriticalWarning ? "critical" : doseOutOfRange ? "moderate" : "low",
+      stakes: "high",
+    },
+  });
+}
+
+/* ─────────────────────────────────────────────────
+   Tool 7: lab_interpretation
+   Verification: fact_check, hallucination_check, confidence, domain_constraints, human_in_the_loop
+   ───────────────────────────────────────────────── */
+
+interface LabAnalysis {
+  lab: string;
+  latest_value: number;
+  unit: string;
+  reference_range: string;
+  status: "normal" | "low" | "high" | "critical";
+  trend: "improving" | "worsening" | "stable" | "insufficient_data";
+  trend_values: number[];
+  clinical_significance: string;
+}
+
+interface LabInterpretationResult {
+  labs_analyzed: LabAnalysis[];
+  critical_alerts: string[];
+  medication_correlations: string[];
+  recommended_actions: string[];
+}
+
+const LAB_KEYS = ["K", "LDL", "HDL", "CRP", "Creatinine", "Copper"] as const;
+type LabKey = typeof LAB_KEYS[number];
+
+// Medication-lab correlations for the demo patient
+const MED_LAB_CORRELATIONS: { lab: LabKey; medication: string; condition: string; detail: string }[] = [
+  { lab: "K", medication: "Lisinopril", condition: "high", detail: "ACE inhibitor increases potassium retention. Patient K+ critically elevated — consider dose reduction or switch to ARB (Losartan)." },
+  { lab: "LDL", medication: "None (no statin)", condition: "high", detail: "No statin therapy despite LDL 148 mg/dL and HTN. ACC/AHA guidelines recommend moderate-intensity statin for this risk profile." },
+  { lab: "Copper", medication: "Dietary restriction", condition: "low", detail: "Low copper may be related to gluten-free diet limiting copper-rich food sources. Consider supplementation or dietary counseling." },
+  { lab: "CRP", medication: "Colchicine (discontinued)", condition: "normal", detail: "CRP normalized after pericarditis treatment with colchicine. Pericarditis considered resolved." },
+];
+
+function computeTrend(values: number[], labKey: LabKey): "improving" | "worsening" | "stable" | "insufficient_data" {
+  if (values.length < 3) return "insufficient_data";
+
+  const first = values[0];
+  const last = values[values.length - 1];
+  const range = REFERENCE_RANGES[labKey];
+  if (!range) return "insufficient_data";
+
+  const delta = last - first;
+  const percentChange = Math.abs(delta / first) * 100;
+
+  // Less than 5% change is stable
+  if (percentChange < 5) return "stable";
+
+  // Determine if moving toward or away from normal range
+  const lastInRange = last >= range.min && last <= range.max;
+  const movingTowardRange =
+    (last > range.max && delta < 0) ||   // Was high, going down
+    (last < range.min && delta > 0) ||   // Was low, going up
+    lastInRange;                          // Now in range
+
+  return movingTowardRange ? "improving" : "worsening";
+}
+
+function getLabStatus(value: number, labKey: LabKey): "normal" | "low" | "high" | "critical" {
+  const range = REFERENCE_RANGES[labKey];
+  if (!range) return "normal";
+
+  if (value >= range.min && value <= range.max) return "normal";
+
+  // Critical thresholds for specific labs
+  if (labKey === "K" && value > 5.5) return "critical";
+  if (labKey === "K" && value < 3.0) return "critical";
+  if (labKey === "CRP" && value > 20) return "critical";
+
+  return value < range.min ? "low" : "high";
+}
+
+export function labInterpretation(labs?: string[]): VerifiedToolResult<LabInterpretationResult> {
+  const requestedLabs = labs && labs.length > 0
+    ? LAB_KEYS.filter((k) => labs.some((l) => l.toLowerCase().includes(k.toLowerCase()) || k.toLowerCase().includes(l.toLowerCase())))
+    : [...LAB_KEYS];
+
+  // If user typed labs we don't recognize, fall back to all
+  const labsToAnalyze = requestedLabs.length > 0 ? requestedLabs : [...LAB_KEYS];
+
+  const analyses: LabAnalysis[] = [];
+  const criticalAlerts: string[] = [];
+  const medCorrelations: string[] = [];
+  const actions: string[] = [];
+
+  for (const labKey of labsToAnalyze) {
+    const trendValues = LAB_TRENDS
+      .map((point) => point[labKey])
+      .filter((v): v is number => v !== null);
+
+    if (trendValues.length === 0) continue;
+
+    const latestValue = trendValues[trendValues.length - 1];
+    const range = REFERENCE_RANGES[labKey];
+    if (!range) continue;
+
+    const status = getLabStatus(latestValue, labKey);
+    const trend = computeTrend(trendValues, labKey);
+
+    let significance: string;
+    if (status === "critical") {
+      significance = `${range.label} at ${latestValue} ${range.unit} is CRITICALLY outside normal range (${range.min}–${range.max}). Immediate clinical attention required.`;
+      criticalAlerts.push(`CRITICAL: ${range.label} = ${latestValue} ${range.unit} (normal: ${range.min}–${range.max})`);
+    } else if (status === "high") {
+      significance = `${range.label} at ${latestValue} ${range.unit} is above normal range (${range.min}–${range.max}). Monitor and consider intervention.`;
+    } else if (status === "low") {
+      significance = `${range.label} at ${latestValue} ${range.unit} is below normal range (${range.min}–${range.max}). Evaluate cause and consider supplementation.`;
+    } else {
+      significance = `${range.label} at ${latestValue} ${range.unit} is within normal range (${range.min}–${range.max}).`;
+    }
+
+    if (trend === "worsening") {
+      significance += ` Trend is WORSENING (${trendValues[0]} → ${latestValue}).`;
+    } else if (trend === "improving") {
+      significance += ` Trend is improving (${trendValues[0]} → ${latestValue}).`;
+    }
+
+    analyses.push({
+      lab: range.label,
+      latest_value: latestValue,
+      unit: range.unit,
+      reference_range: `${range.min}–${range.max}`,
+      status,
+      trend,
+      trend_values: trendValues,
+      clinical_significance: significance,
+    });
+
+    // Check medication correlations
+    for (const corr of MED_LAB_CORRELATIONS) {
+      if (corr.lab === labKey && (
+        (corr.condition === "high" && (status === "high" || status === "critical")) ||
+        (corr.condition === "low" && status === "low") ||
+        (corr.condition === "normal" && status === "normal")
+      )) {
+        medCorrelations.push(`${range.label} ↔ ${corr.medication}: ${corr.detail}`);
+      }
+    }
+  }
+
+  // Generate recommended actions
+  if (criticalAlerts.length > 0) {
+    actions.push("Repeat critical labs within 24-48 hours to confirm values.");
+  }
+  const kAnalysis = analyses.find((a) => a.lab === "Potassium");
+  if (kAnalysis && (kAnalysis.status === "high" || kAnalysis.status === "critical")) {
+    actions.push("Reassess Lisinopril — consider switching to ARB (Losartan 50mg) to reduce hyperkalemia risk.");
+    actions.push("Order repeat BMP to monitor potassium trend.");
+  }
+  const ldlAnalysis = analyses.find((a) => a.lab === "LDL Cholesterol");
+  if (ldlAnalysis && (ldlAnalysis.status === "high" || ldlAnalysis.status === "critical")) {
+    actions.push("Initiate statin therapy discussion — moderate-intensity atorvastatin 20mg per ACC/AHA guidelines.");
+  }
+  const copperAnalysis = analyses.find((a) => a.lab === "Copper");
+  if (copperAnalysis && copperAnalysis.status === "low") {
+    actions.push("Dietary copper assessment — recommend copper-rich foods (shellfish, dark chocolate, seeds). Avoid peanuts (allergy). Consider copper supplementation if levels persist.");
+  }
+
+  const data: LabInterpretationResult = {
+    labs_analyzed: analyses,
+    critical_alerts: criticalAlerts,
+    medication_correlations: medCorrelations,
+    recommended_actions: actions,
+  };
+
+  const hasCritical = analyses.some((a) => a.status === "critical");
+  const hasOutOfRange = analyses.some((a) => a.status !== "normal");
+
+  return verify(data, {
+    factCheck: {
+      items: labsToAnalyze,
+      knownDatabase: [...LAB_KEYS],
+      domain: "Laboratory Medicine",
+      sourceName: "LOINC Reference Ranges / Clinical Lab Standards",
+    },
+    hallucinationCheck: {
+      claims: analyses.map((a) => ({
+        claim: `${a.lab} = ${a.latest_value} ${a.unit}`,
+        supportedByData: true, // All values come directly from LAB_TRENDS
+      })),
+    },
+    confidenceInput: {
+      dataCompleteness: 0.85,
+      sourceReliability: 0.95,
+      matchQuality: analyses.length / labsToAnalyze.length,
+    },
+    domainConstraints: {
+      outOfRangeValues: hasCritical ? criticalAlerts : undefined,
+    },
+    humanReviewInput: {
+      confidence: 0.90,
+      severity: hasCritical ? "critical" : hasOutOfRange ? "moderate" : "low",
+      stakes: hasCritical ? "high" : "medium",
+    },
+  });
+}
+
+/* ─────────────────────────────────────────────────
+   Tool 8: medication_reconciliation
+   Verification: fact_check, confidence, domain_constraints, human_in_the_loop
+   ───────────────────────────────────────────────── */
+
+interface Discrepancy {
+  medication: string;
+  type: "missing_from_chart" | "missing_from_ehr" | "dose_mismatch" | "still_listed_discontinued";
+  detail: string;
+  recommendation: string;
+}
+
+interface TherapyGap {
+  therapy: string;
+  indication: string;
+  guideline: string;
+  recommendation: string;
+}
+
+interface DurationAlert {
+  medication: string;
+  start_date: string;
+  prescribed_duration: string;
+  elapsed_days: number;
+  status: "within_course" | "overdue_for_completion" | "needs_review";
+  recommendation: string;
+}
+
+interface MedicationReconciliationResult {
+  chart_medications: { name: string; dose: string; freq: string; source: string }[];
+  ehr_medications: { name: string; dose: string; freq: string; source: string }[];
+  discrepancies: Discrepancy[];
+  therapy_gaps: TherapyGap[];
+  duration_alerts: DurationAlert[];
+  summary: string;
+}
+
+export function medicationReconciliation(): VerifiedToolResult<MedicationReconciliationResult> {
+  const normalize = (name: string) => name.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+  // Chart medications (what the patient/provider reports)
+  const chartMeds = PATIENT_INFO.medications.map((m) => ({
+    name: m.name, dose: m.dose, freq: m.freq, source: "Patient Chart",
+  }));
+
+  // EHR medications (what the system has on file)
+  const ehrMeds = EHR_MEDICATION_LIST.map((m) => ({
+    name: m.name, dose: m.dose, freq: m.freq, source: "EHR System", status: m.status,
+  }));
+
+  const discrepancies: Discrepancy[] = [];
+
+  // Find meds in chart but not in EHR (active only)
+  const activeEhrNames = EHR_MEDICATION_LIST.filter((m) => m.status === "active").map((m) => normalize(m.name));
+  for (const chartMed of chartMeds) {
+    const inEhr = activeEhrNames.some((ehrName) =>
+      normalize(chartMed.name).includes(ehrName) || ehrName.includes(normalize(chartMed.name))
+    );
+    if (!inEhr) {
+      discrepancies.push({
+        medication: chartMed.name,
+        type: "missing_from_ehr",
+        detail: `${chartMed.name} (${chartMed.dose} ${chartMed.freq}) is on the patient chart but not in the active EHR medication list.`,
+        recommendation: `Verify if ${chartMed.name} should be added to the EHR. If patient-reported supplement, document in EHR for completeness.`,
+      });
+    }
+  }
+
+  // Find discontinued meds still appearing in EHR
+  const discontinuedInTimeline = MEDICATION_TIMELINE.filter((m) => m.event === "discontinued");
+  for (const disc of discontinuedInTimeline) {
+    const stillInEhr = EHR_MEDICATION_LIST.find((e) =>
+      normalize(e.name).includes(normalize(disc.drug.split(" ")[0])) && e.status === "discontinued"
+    );
+    if (stillInEhr) {
+      discrepancies.push({
+        medication: disc.drug,
+        type: "still_listed_discontinued",
+        detail: `${disc.drug} was discontinued on ${disc.endDate} but remains on the EHR medication list with "discontinued" status.`,
+        recommendation: "Verify EHR reflects correct status. Archive discontinued medication to reduce list clutter.",
+      });
+    }
+  }
+
+  // Therapy gaps
+  const therapyGaps: TherapyGap[] = [];
+
+  // Check for missing statin
+  const hasStatin = chartMeds.some((m) =>
+    normalize(m.name).includes("statin") || normalize(m.name).includes("atorvastatin") || normalize(m.name).includes("rosuvastatin")
+  );
+  if (!hasStatin) {
+    therapyGaps.push({
+      therapy: "Statin Therapy",
+      indication: "Dyslipidemia with elevated cardiovascular risk — LDL 148 mg/dL, HTN, age 59, male, family history of MI",
+      guideline: "ACC/AHA 2018 Cholesterol Guidelines recommend moderate-to-high intensity statin for patients with LDL >100 and elevated ASCVD risk (>7.5%).",
+      recommendation: "Discuss initiating Atorvastatin 20mg daily. Patient has previously deferred but may benefit given persistent LDL elevation.",
+    });
+  }
+
+  // Check for planned Losartan switch (referenced in visit notes)
+  const hasLosartan = chartMeds.some((m) => normalize(m.name).includes("losartan"));
+  const hasLisinopril = chartMeds.some((m) => normalize(m.name).includes("lisinopril"));
+  const latestK = LAB_TRENDS.filter((l) => l.K !== null).pop()?.K;
+  if (hasLisinopril && !hasLosartan && latestK && latestK > 5.5) {
+    therapyGaps.push({
+      therapy: "ACE Inhibitor → ARB Switch",
+      indication: `K+ critically elevated at ${latestK} mEq/L on Lisinopril. Visit note (Jan 2026) documents plan to switch to Losartan 50mg.`,
+      guideline: "When ACE inhibitor causes persistent hyperkalemia, switching to ARB is recommended. ARBs cause less K+ retention.",
+      recommendation: "Execute planned switch: Discontinue Lisinopril 10mg, start Losartan 50mg daily. Recheck K+ in 1-2 weeks.",
+    });
+  }
+
+  // Duration alerts
+  const durationAlerts: DurationAlert[] = [];
+  const today = new Date();
+
+  // Doxycycline — prescribed for 10 days
+  const doxyTimeline = MEDICATION_TIMELINE.find((m) => normalize(m.drug).includes("doxycycline"));
+  if (doxyTimeline) {
+    const startDate = new Date(doxyTimeline.startDate);
+    const elapsedDays = Math.floor((today.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24));
+    const prescribedDays = 10;
+
+    durationAlerts.push({
+      medication: doxyTimeline.drug,
+      start_date: doxyTimeline.startDate,
+      prescribed_duration: `${prescribedDays} days`,
+      elapsed_days: elapsedDays,
+      status: elapsedDays <= prescribedDays ? "within_course" : elapsedDays <= prescribedDays + 7 ? "overdue_for_completion" : "needs_review",
+      recommendation: elapsedDays > prescribedDays
+        ? `Doxycycline was prescribed for ${prescribedDays} days starting ${doxyTimeline.startDate}. ${elapsedDays} days have elapsed. Review if course is complete and discontinue if infection resolved.`
+        : `Doxycycline course is within prescribed ${prescribedDays}-day duration. ${prescribedDays - elapsedDays} days remaining.`,
+    });
+  }
+
+  // Aspirin dose concern (not a duration issue, but a dosing reconciliation flag)
+  const aspirinMed = chartMeds.find((m) => normalize(m.name).includes("aspirin"));
+  if (aspirinMed && aspirinMed.dose === "325mg") {
+    const aspirinTimeline = MEDICATION_TIMELINE.find((m) => normalize(m.drug).includes("aspirin"));
+    if (aspirinTimeline) {
+      const startDate = new Date(aspirinTimeline.startDate);
+      const elapsedDays = Math.floor((today.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24));
+      durationAlerts.push({
+        medication: "Aspirin 325mg",
+        start_date: aspirinTimeline.startDate,
+        prescribed_duration: "Ongoing (no end date)",
+        elapsed_days: elapsedDays,
+        status: "needs_review",
+        recommendation: "Aspirin 325mg has been ongoing since pericarditis treatment (Mar 2024). Now that pericarditis is resolved, evaluate step-down to 81mg for maintenance cardioprotection per ACC/AHA guidelines.",
+      });
+    }
+  }
+
+  // Build summary
+  const totalIssues = discrepancies.length + therapyGaps.length + durationAlerts.filter((d) => d.status !== "within_course").length;
+  const summary = totalIssues > 0
+    ? `Medication reconciliation found ${totalIssues} item(s) requiring attention: ${discrepancies.length} discrepancy/discrepancies, ${therapyGaps.length} therapy gap(s), and ${durationAlerts.filter((d) => d.status !== "within_course").length} duration alert(s).`
+    : "Medication reconciliation complete. No discrepancies or therapy gaps identified.";
+
+  const data: MedicationReconciliationResult = {
+    chart_medications: chartMeds,
+    ehr_medications: ehrMeds.map(({ status: _s, ...rest }) => rest),
+    discrepancies,
+    therapy_gaps: therapyGaps,
+    duration_alerts: durationAlerts,
+    summary,
+  };
+
+  const hasDiscrepancies = discrepancies.length > 0;
+  const hasGaps = therapyGaps.length > 0;
+  const hasUrgentAlerts = durationAlerts.some((d) => d.status === "needs_review");
+
+  return verify(data, {
+    factCheck: {
+      items: chartMeds.map((m) => m.name),
+      knownDatabase: [...KNOWN_DRUGS, ...EHR_MEDICATION_LIST.map((m) => m.name)],
+      domain: "Medication Reconciliation",
+      sourceName: "EHR Medication Records",
+    },
+    confidenceInput: {
+      dataCompleteness: 0.90,
+      sourceReliability: 0.88,
+      matchQuality: 0.85,
+    },
+    domainConstraints: {
+      hasSevereInteractions: hasGaps && hasUrgentAlerts,
+    },
+    humanReviewInput: {
+      confidence: 0.85,
+      severity: hasGaps ? "high" : hasDiscrepancies ? "moderate" : "low",
+      stakes: "high",
     },
   });
 }

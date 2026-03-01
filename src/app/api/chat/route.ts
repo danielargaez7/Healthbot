@@ -11,6 +11,9 @@ import {
   providerSearch,
   appointmentAvailability,
   insuranceCoverageCheck,
+  dosingValidation,
+  labInterpretation,
+  medicationReconciliation,
 } from "@/lib/clinical-tools";
 
 // In-memory store for tool calls (keyed by request ID, auto-expires after 30s)
@@ -157,6 +160,44 @@ export async function POST(req: Request) {
         }),
         execute: async ({ procedure_code, plan_id }) =>
           insuranceCoverageCheck(procedure_code, plan_id),
+      }),
+
+      dosing_validation: tool({
+        description:
+          "Validate medication dosing against clinical guidelines. Use this when the user asks about whether a dose is appropriate, asks about dosing recommendations, or mentions a specific medication dose. Checks against standard dose ranges, max daily doses, and indication-specific recommendations.",
+        inputSchema: z.object({
+          medication: z
+            .string()
+            .describe("Medication name (e.g. Aspirin, Lisinopril, Acetaminophen)"),
+          dose: z
+            .string()
+            .describe("Current dose (e.g. '325mg', '10mg', '500mg')"),
+          indication: z
+            .string()
+            .optional()
+            .describe("Clinical indication (e.g. 'cardioprotective', 'hypertension', 'analgesic')"),
+        }),
+        execute: async ({ medication, dose, indication }) =>
+          dosingValidation(medication, dose, indication),
+      }),
+
+      lab_interpretation: tool({
+        description:
+          "Interpret patient lab results, flag abnormalities, analyze trends over time, and correlate with current medications. Use this when the user asks about lab results, abnormal values, lab trends, or what their labs mean. Can analyze all labs or specific ones.",
+        inputSchema: z.object({
+          labs: z
+            .array(z.string())
+            .optional()
+            .describe("Specific lab names to analyze (e.g. ['Potassium', 'LDL']). Omit to analyze all available labs."),
+        }),
+        execute: async ({ labs }) => labInterpretation(labs),
+      }),
+
+      medication_reconciliation: tool({
+        description:
+          "Compare patient chart medications against EHR records to identify discrepancies, therapy gaps, and duration concerns. Use this when the user asks about medication reconciliation, medication list review, therapy gaps, missing medications, or whether all medications are up to date.",
+        inputSchema: z.object({}),
+        execute: async () => medicationReconciliation(),
       }),
     },
   });
