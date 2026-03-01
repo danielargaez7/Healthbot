@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unused-vars */
 /* ═══════════════════════════════════════════════
    MedAssist Clinical Tools — callable functions
    8 domain-specific healthcare tools
